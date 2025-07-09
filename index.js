@@ -2,7 +2,7 @@ const express = require('express');
 const { google } = require('googleapis');
 const cors = require('cors');
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
@@ -63,5 +63,5 @@ app.get('/data', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`API corriendo en http://localhost:${PORT}`);
+  console.log(`API corriendo en puerto ${PORT}`);
 });
