@@ -7,7 +7,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 
 const auth = new google.auth.GoogleAuth({
-  // keyFile: 'northern-cubist-454520-q8-999e42042598.json', // Asegúrate de que esté en la raíz o ajusta la ruta
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
   scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
 });
