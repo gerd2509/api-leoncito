@@ -17,7 +17,7 @@ app.get('/data', async (req, res) => {
     const sheets = google.sheets({ version: 'v4', auth: client });
 
     const spreadsheetId = '1j3b7k-vD9UzWLqz6JJksm5Vj3dWvtqL4SckMP21II94'; // Reemplaza por tu ID real
-    const range = 'Respuestas de formulario 1!A1:Z'; // Ajusta si usas otro nombre de hoja
+    const range = 'Respuestas de formulario 1!A:ZZZ'; // Ajusta si usas otro nombre de hoja
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
