@@ -6,6 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+app.use(express.json());
 
 // 🔹 Configuración de autenticaciones por tipo
 const googleAuthConfigs = {
@@ -75,6 +76,16 @@ const sheetsConfigs = {
     authKey: 'claveUnica',
     spreadsheetId: '18Dcde-XEdMUEMZ3Fekz3gkXpPP7UzPZxpnoMzcZlm-w',
     range: 'Respuestas de formulario 1!A:ZZZ',
+  },
+  ferre: {
+    authKey: 'claveUnica',
+    spreadsheetId: '1q8flDOGxiZdhmP3Kpz4m8s74AKb6b8j60hgRlqfNpPo',
+    range: 'Respuestas de formulario 1!A:ZZZ',
+  },
+  usuarios: {
+    authKey: 'claveUnica',
+    spreadsheetId: '1z7Qx5vvwCkX2TjVbhUIBR8cMCW3IcdAQHXrIalz0_ZI',
+    range: 'usuarios!A:F',
   }
 };
 
@@ -133,6 +144,56 @@ app.get('/data/:sheetName', async (req, res) => {
   } catch (error) {
     console.error(`❌ Error al obtener datos de ${sheetName}:`, error);
     res.status(500).send('Error al obtener datos de Google Sheets');
+  }
+});
+
+// 🔐 Login: POST /auth/login
+app.post('/auth/login', async (req, res) => {
+  const { usuario, password } = req.body;
+
+  if (!usuario || !password) {
+    return res.status(400).json({ success: false, message: 'Usuario y contraseña requeridos.' });
+  }
+
+  try {
+    const config = sheetsConfigs['usuarios'];
+    const auth = googleAuthConfigs[config.authKey];
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: 'v4', auth: client });
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: config.spreadsheetId,
+      range: config.range,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      return res.status(500).json({ success: false, message: 'No se encontraron usuarios.' });
+    }
+
+    const [headers, ...data] = rows;
+    const idx = (col) => headers.indexOf(col);
+
+    const user = data.find(
+      (row) =>
+        row[idx('usuario')] === usuario &&
+        row[idx('password')] === password &&
+        (row[idx('activo')] || '').toUpperCase() === 'SI'
+    );
+
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Credenciales inválidas o usuario inactivo.' });
+    }
+
+    res.json({
+      success: true,
+      nombre: user[idx('nombre')] || '',
+      rol: user[idx('rol')] || '',
+      sede: user[idx('sede')] || '',
+    });
+  } catch (error) {
+    console.error('❌ Error en /auth/login:', error);
+    res.status(500).json({ success: false, message: 'Error al autenticar.' });
   }
 });
 
