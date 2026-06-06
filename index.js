@@ -82,6 +82,11 @@ const sheetsConfigs = {
     spreadsheetId: '1q8flDOGxiZdhmP3Kpz4m8s74AKb6b8j60hgRlqfNpPo',
     range: 'Respuestas de formulario 1!A:ZZZ',
   },
+  sedes: {
+    authKey: 'claveUnica',
+    spreadsheetId: '1zHH-1n2fxknSOfPBje0U3x_hRXBXBh4M21KRGHGBbbQ',
+    range: 'Respuestas de formulario 1!A:ZZZ',
+  },
   usuarios: {
     authKey: 'claveUnica',
     spreadsheetId: '1z7Qx5vvwCkX2TjVbhUIBR8cMCW3IcdAQHXrIalz0_ZI',
