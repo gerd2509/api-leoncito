@@ -147,12 +147,39 @@ app.get('/data/:sheetName', async (req, res) => {
     });
 
     // Transformar filas a JSON
-    const jsonData = data.map((row) =>
+    let jsonData = data.map((row) =>
       headers.reduce((acc, header, i) => ({
         ...acc,
         [header]: row[i] || '',
       }), {})
     );
+
+    // 🔎 Filtro opcional por fecha (evita traer todo el histórico: p.ej. /data/sedes?desde=2026-07-01&hasta=2026-07-31)
+    // Se filtra por la columna de fecha del sheet ("Marca temporal" o "Timestamp"),
+    // comparando en formato yyyy-mm-dd. Solo aplica si se envía desde/hasta.
+    const { desde, hasta } = req.query;
+    if (desde || hasta) {
+      const colFecha = headers.includes('Marca temporal')
+        ? 'Marca temporal'
+        : (headers.includes('Timestamp') ? 'Timestamp' : null);
+      if (colFecha) {
+        const toKey = (marca) => {
+          if (!marca) return null;
+          const p = String(marca).trim().split(' ')[0].split('/'); // d/M/yyyy
+          if (p.length !== 3) return null;
+          const [d, mo, y] = p;
+          if (!y || !mo || !d) return null;
+          return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        };
+        jsonData = jsonData.filter((row) => {
+          const k = toKey(row[colFecha]);
+          if (!k) return false;
+          if (desde && k < desde) return false;
+          if (hasta && k > hasta) return false;
+          return true;
+        });
+      }
+    }
 
     res.json(jsonData);
   } catch (error) {
