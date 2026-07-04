@@ -2,12 +2,19 @@ require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
 const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// 🐘 PostgreSQL (Neon) — para el formulario de registro de gestión.
+// La cadena vive en la variable de entorno DATABASE_URL (nunca en el código).
+const pgPool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
 
 // 🔹 Configuración de autenticaciones por tipo
 const googleAuthConfigs = {
@@ -235,6 +242,48 @@ app.post('/auth/login', async (req, res) => {
   } catch (error) {
     console.error('❌ Error en /auth/login:', error);
     res.status(500).json({ success: false, message: 'Error al autenticar.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📝 Registro de gestión de ventas (formulario de vendedores) → PostgreSQL
+// POST /gestion  (body con los campos del formulario; los condicionales pueden ir null)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/gestion', async (req, res) => {
+  if (!pgPool) {
+    return res.status(500).json({ success: false, message: 'Base de datos no configurada (falta DATABASE_URL).' });
+  }
+
+  const b = req.body || {};
+  // Validación mínima de los campos obligatorios base.
+  const requeridos = ['dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado'];
+  for (const campo of requeridos) {
+    if (!b[campo] || b[campo].toString().trim() === '') {
+      return res.status(400).json({ success: false, message: `Falta el campo obligatorio: ${campo}.` });
+    }
+  }
+
+  const norm = (v) => (v === undefined || v === null || v === '' ? null : v);
+  const valorVenta = (b.valor_venta === '' || b.valor_venta === undefined || b.valor_venta === null)
+    ? null
+    : Number(String(b.valor_venta).replace(/[^0-9.]/g, '')) || null;
+
+  try {
+    const q = `INSERT INTO gestion
+      (registrado_por, dni_cliente, sede, asesor, tipo_gestion, resultado,
+       motivo_contacto, motivo_no_contacto, fecha_compromiso, valor_venta,
+       producto_interes, detalle_contacto, celular_actualizado)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`;
+    const vals = [
+      norm(b.registrado_por), b.dni_cliente, b.sede, b.asesor, b.tipo_gestion, b.resultado,
+      norm(b.motivo_contacto), norm(b.motivo_no_contacto), norm(b.fecha_compromiso), valorVenta,
+      norm(b.producto_interes), norm(b.detalle_contacto), norm(b.celular_actualizado),
+    ];
+    const { rows } = await pgPool.query(q, vals);
+    res.json({ success: true, gestion: rows[0] });
+  } catch (error) {
+    console.error('❌ Error en POST /gestion:', error);
+    res.status(500).json({ success: false, message: 'No se pudo guardar la gestión.' });
   }
 });
 
