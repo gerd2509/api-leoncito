@@ -16,6 +16,8 @@
     "express": "^5.1.0",
     "googleapis": "^149.0.0",
     "mssql": "^11.0.1",
-    "pg": "^8.13.1"
+    "multer": "^2.2.0",
+    "pg": "^8.13.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }
