@@ -5,6 +5,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -200,50 +201,27 @@ app.get('/data/:sheetName', async (req, res) => {
   }
 });
 
-// 🔐 Login: POST /auth/login
+// 🔐 Login: POST /auth/login — valida SOLO contra la BD (usuarios), bcrypt.
+// El sheet ya no se usa en runtime (solo sirvió para la migración inicial).
 app.post('/auth/login', async (req, res) => {
   const { usuario, password } = req.body;
 
   if (!usuario || !password) {
     return res.status(400).json({ success: false, message: 'Usuario y contraseña requeridos.' });
   }
+  if (!pgPool) {
+    return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  }
 
   try {
-    const config = sheetsConfigs['usuarios'];
-    const auth = googleAuthConfigs[config.authKey];
-    const client = await auth.getClient();
-    const sheets = google.sheets({ version: 'v4', auth: client });
-
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: config.spreadsheetId,
-      range: config.range,
-    });
-
-    const rows = response.data.values;
-    if (!rows || rows.length < 2) {
-      return res.status(500).json({ success: false, message: 'No se encontraron usuarios.' });
-    }
-
-    const [headers, ...data] = rows;
-    const idx = (col) => headers.indexOf(col);
-
-    const user = data.find(
-      (row) =>
-        row[idx('usuario')] === usuario &&
-        row[idx('password')] === password &&
-        (row[idx('activo')] || '').toUpperCase() === 'SI'
-    );
-
-    if (!user) {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query('SELECT * FROM usuarios WHERE lower(usuario) = lower($1)', [usuario]);
+    const u = rows[0];
+    const ok = u && u.activo && await bcrypt.compare(password, u.password_hash || '');
+    if (!ok) {
       return res.status(401).json({ success: false, message: 'Credenciales inválidas o usuario inactivo.' });
     }
-
-    res.json({
-      success: true,
-      nombre: user[idx('nombre')] || '',
-      rol: user[idx('rol')] || '',
-      sede: user[idx('sede')] || '',
-    });
+    res.json({ success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '' });
   } catch (error) {
     console.error('❌ Error en /auth/login:', error);
     res.status(500).json({ success: false, message: 'Error al autenticar.' });
@@ -860,10 +838,929 @@ app.get('/margen-ventas', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 👤 USUARIOS → PostgreSQL (Neon). Contraseñas hasheadas con bcrypt.
+// Reemplaza (con fallback) al sheet 'usuarios'. CRUD para el módulo Seguridad.
+// ─────────────────────────────────────────────────────────────────────────────
+let usuariosSchemaLista = false;
+async function ensureUsuariosSchema() {
+  if (!pgPool || usuariosSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id             BIGSERIAL PRIMARY KEY,
+      usuario        TEXT UNIQUE NOT NULL,
+      password_hash  TEXT NOT NULL,
+      nombre         TEXT,
+      rol            TEXT,
+      sede           TEXT,
+      activo         BOOLEAN NOT NULL DEFAULT true,
+      creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  usuariosSchemaLista = true;
+}
+
+// Migración única: si la tabla está vacía, importa los usuarios del sheet (hasheando).
+async function migrarUsuariosDesdeSheet() {
+  if (!pgPool) return;
+  await ensureUsuariosSchema();
+  const { rows } = await pgPool.query('SELECT COUNT(*)::int AS n FROM usuarios');
+  if (rows[0].n > 0) return;
+  try {
+    const config = sheetsConfigs['usuarios'];
+    const auth = googleAuthConfigs[config.authKey];
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: 'v4', auth: client });
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
+    const data = resp.data.values;
+    if (!data || data.length < 2) return;
+    const [headers, ...filas] = data;
+    const idx = (c) => headers.indexOf(c);
+    let n = 0;
+    for (const row of filas) {
+      const usuario = (row[idx('usuario')] || '').toString().trim();
+      const pass = (row[idx('password')] || '').toString();
+      if (!usuario || !pass) continue;
+      const hash = await bcrypt.hash(pass, 10);
+      const activo = (row[idx('activo')] || '').toString().trim().toUpperCase() === 'SI';
+      await pgPool.query(
+        `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, activo)
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (usuario) DO NOTHING`,
+        [usuario, hash, (row[idx('nombre')] || '').toString().trim(),
+         (row[idx('rol')] || '').toString().trim(), (row[idx('sede')] || '').toString().trim(), activo]
+      );
+      n++;
+    }
+    console.log(`🔐 Migrados ${n} usuarios del sheet a la BD.`);
+  } catch (e) {
+    console.error('⚠️ No se pudo migrar usuarios del sheet:', e.message);
+  }
+}
+
+// GET /usuarios — lista (sin el hash).
+app.get('/usuarios', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query(
+      'SELECT id, usuario, nombre, rol, sede, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+    );
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
+});
+
+// POST /usuarios — crea (hashea la contraseña).
+app.post('/usuarios', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  const usuario = (b.usuario || '').toString().trim();
+  const password = (b.password || '').toString();
+  if (!usuario || !password) return res.status(400).json({ success: false, message: 'Usuario y contraseña son obligatorios.' });
+  try {
+    await ensureUsuariosSchema();
+    const hash = await bcrypt.hash(password, 10);
+    const { rows } = await pgPool.query(
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, activo)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, usuario, nombre, rol, sede, activo`,
+      [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
+       (b.sede || '').toString().trim(), b.activo !== false]
+    );
+    res.json({ success: true, usuario: rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ success: false, message: 'Ya existe un usuario con ese nombre de acceso.' });
+    console.error('❌ POST /usuarios', e); res.status(500).json({ success: false, message: 'No se pudo crear el usuario.' });
+  }
+});
+
+// PUT /usuarios/:id — edita; si mandan password (no vacío) se rehashea.
+app.put('/usuarios/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  const id = parseInt(req.params.id, 10);
+  const usuario = (b.usuario || '').toString().trim();
+  if (!usuario) return res.status(400).json({ success: false, message: 'El usuario es obligatorio.' });
+  try {
+    await ensureUsuariosSchema();
+    const campos = ['usuario = $2', 'nombre = $3', 'rol = $4', 'sede = $5', 'activo = $6', 'actualizado_en = now()'];
+    const params = [id, usuario, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
+                    (b.sede || '').toString().trim(), b.activo !== false];
+    if (b.password && b.password.toString().trim() !== '') {
+      const hash = await bcrypt.hash(b.password.toString(), 10);
+      params.push(hash);
+      campos.push(`password_hash = $${params.length}`);
+    }
+    const { rows } = await pgPool.query(
+      `UPDATE usuarios SET ${campos.join(', ')} WHERE id = $1
+       RETURNING id, usuario, nombre, rol, sede, activo`, params
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
+    res.json({ success: true, usuario: rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ success: false, message: 'Ya existe un usuario con ese nombre de acceso.' });
+    console.error('❌ PUT /usuarios/:id', e); res.status(500).json({ success: false, message: 'No se pudo actualizar el usuario.' });
+  }
+});
+
+// PATCH /usuarios/:id/estado — activar / desactivar.
+app.patch('/usuarios/:id/estado', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const id = parseInt(req.params.id, 10);
+  const activo = !!(req.body && req.body.activo);
+  try {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query(
+      'UPDATE usuarios SET activo = $2, actualizado_en = now() WHERE id = $1 RETURNING id, usuario, activo', [id, activo]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
+    res.json({ success: true, usuario: rows[0] });
+  } catch (e) { console.error('❌ PATCH /usuarios/:id/estado', e); res.status(500).json({ success: false, message: 'No se pudo cambiar el estado.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔑 PERMISOS (matriz Rol+Perfil → módulos) → PostgreSQL (Neon).
+// Reemplaza el localStorage del navegador para que Seguridad sea centralizada.
+// ─────────────────────────────────────────────────────────────────────────────
+let permisosSchemaLista = false;
+async function ensurePermisosSchema() {
+  if (!pgPool || permisosSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS permisos (
+      clave          TEXT PRIMARY KEY,
+      modulos        JSONB NOT NULL DEFAULT '[]'::jsonb,
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  permisosSchemaLista = true;
+}
+
+// GET /permisos → { 'gerente-call': [...módulos], ... }
+app.get('/permisos', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensurePermisosSchema();
+    const { rows } = await pgPool.query('SELECT clave, modulos FROM permisos');
+    const map = {};
+    rows.forEach(r => { map[r.clave] = r.modulos || []; });
+    res.json(map);
+  } catch (e) { console.error('❌ GET /permisos', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los permisos.' }); }
+});
+
+// PUT /permisos → body = { clave: [módulos], ... } (upsert de todas las claves).
+app.put('/permisos', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const map = req.body || {};
+  try {
+    await ensurePermisosSchema();
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const [clave, modulos] of Object.entries(map)) {
+        await client.query(
+          `INSERT INTO permisos (clave, modulos, actualizado_en) VALUES ($1, $2::jsonb, now())
+           ON CONFLICT (clave) DO UPDATE SET modulos = EXCLUDED.modulos, actualizado_en = now()`,
+          [clave, JSON.stringify(Array.isArray(modulos) ? modulos : [])]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; }
+    finally { client.release(); }
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /permisos', e); res.status(500).json({ success: false, message: 'No se pudieron guardar los permisos.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📋 GESTIÓN REALZZA → PostgreSQL (Neon). Reemplaza el Google Form de campo.
+// La tabla guarda las 29 columnas del form + marca_temporal (real) + origen.
+// GET devuelve las MISMAS cabeceras de la hoja para que los módulos que hoy
+// consumen /data/campo funcionen igual cambiando una sola línea.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Columnas de la tabla, en el orden del INSERT.
+const GRZ_COLS = [
+  'marca_temporal', 'marca_temporal_raw', 'asesor_realzza', 'sede', 'tipo_base',
+  'dni_cliente', 'celular_gestionado', 'estado_gestion', 'medio_primer_contacto',
+  'resultado_gestion', 'producto_interes', 'motivo_interes', 'motivo_agendamiento',
+  'fecha_interes_agendamiento', 'hora_interes_agendamiento', 'comentario_agendamiento',
+  'fecha_interes_derivacion', 'hora_interes_derivacion', 'comentario_derivacion',
+  'motivo_no_interes', 'comentario_no_interes', 'motivo_no_atendible', 'comentario_no_atendible',
+  'motivos_tercero_relacionado', 'fecha_rellamada', 'hora_rellamada', 'numero_titular_actual',
+  'motivo_no_contacto', 'motivo_no_cierre', 'comentario_venta_no_concretada', 'origen',
+];
+
+let grzSchemaLista = false;
+async function ensureGestionRealzzaSchema() {
+  if (!pgPool || grzSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS gestion_realzza (
+      id                            BIGSERIAL PRIMARY KEY,
+      marca_temporal                TIMESTAMP,
+      marca_temporal_raw            TEXT,
+      asesor_realzza                TEXT,
+      sede                          TEXT,
+      tipo_base                     TEXT,
+      dni_cliente                   TEXT,
+      celular_gestionado            TEXT,
+      estado_gestion                TEXT,
+      medio_primer_contacto         TEXT,
+      resultado_gestion             TEXT,
+      producto_interes              TEXT,
+      motivo_interes                TEXT,
+      motivo_agendamiento           TEXT,
+      fecha_interes_agendamiento    TEXT,
+      hora_interes_agendamiento     TEXT,
+      comentario_agendamiento       TEXT,
+      fecha_interes_derivacion      TEXT,
+      hora_interes_derivacion       TEXT,
+      comentario_derivacion         TEXT,
+      motivo_no_interes             TEXT,
+      comentario_no_interes         TEXT,
+      motivo_no_atendible           TEXT,
+      comentario_no_atendible       TEXT,
+      motivos_tercero_relacionado   TEXT,
+      fecha_rellamada               TEXT,
+      hora_rellamada                TEXT,
+      numero_titular_actual         TEXT,
+      motivo_no_contacto            TEXT,
+      motivo_no_cierre              TEXT,
+      comentario_venta_no_concretada TEXT,
+      origen                        TEXT NOT NULL DEFAULT 'app',
+      creado_en                     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_grz_marca  ON gestion_realzza (marca_temporal);
+    CREATE INDEX IF NOT EXISTS ix_grz_asesor ON gestion_realzza (asesor_realzza);
+    CREATE INDEX IF NOT EXISTS ix_grz_dni    ON gestion_realzza (dni_cliente);
+  `);
+  grzSchemaLista = true;
+}
+
+// "14/10/2025 9:18:07" → Date. Devuelve null si no parsea.
+function parseMarcaTemporal(s) {
+  if (!s) return null;
+  const [fecha, hora] = s.toString().trim().split(' ');
+  const [d, m, y] = (fecha || '').split('/').map(Number);
+  if (!d || !m || !y) return null;
+  const [hh = 0, mm = 0, ss = 0] = (hora || '').split(':').map(Number);
+  const dt = new Date(y, m - 1, d, hh || 0, mm || 0, ss || 0);
+  return isNaN(dt) ? null : dt;
+}
+function formatMarca(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()} ${d.getHours()}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// Fila de la hoja (objeto por cabecera) → arreglo en el orden de GRZ_COLS.
+function mapRealzzaRow(r, origen) {
+  return [
+    parseMarcaTemporal(r['Marca temporal']),
+    toStr(r['Marca temporal']),
+    toStr(r['ASESOR REALZZA']), toStr(r['SEDE']), toStr(r['TIPO DE BASE']),
+    toStr(r['DNI CLIENTE']), toStr(r['CELULAR GESTIONADO']), toStr(r['ESTADO DE GESTIÓN']),
+    toStr(r['MEDIO DE PRIMER CONTACTO']), toStr(r['RESULTADO DE GESTIÓN']), toStr(r['PRODUCTO INTERÉS']),
+    toStr(r['MOTIVO INTERÉS']), toStr(r['MOTIVO AGENDAMIENTO']), toStr(r['FECHA DE INTERÉS AGENDAMIENTO']),
+    toStr(r['HORA APROXIMADA INTERÉS AGENDAMIENTO']), toStr(r['COMENTARIO ADICIONAL AGENDAMIENTO']),
+    toStr(r['FECHA DE INTERÉS DERIVACIÓN']), toStr(r['HORA APROXIMADA INTERÉS DERIVACIÓN']),
+    toStr(r['COMENTARIO ADICIONAL DERIVACIÓN']), toStr(r['MOTIVO NO INTERÉS']), toStr(r['COMENTARIO ADICIONAL NO INTERÉS']),
+    toStr(r['MOTIVO NO ATENDIBLE']), toStr(r['COMENTARIO ADICIONAL NO ATENDIBLE']), toStr(r['MOTIVOS TERCERO RELACIONADO']),
+    toStr(r['FECHA DE RE-LLAMADA']), toStr(r['HORA DE RELLAMADA']), toStr(r['NÚMERO TITULAR ACTUAL']),
+    toStr(r['MOTIVO NO CONTACTO']), toStr(r['MOTIVO DE NO CIERRE']), toStr(r['COMENTARIO VENTA NO CONCRETADA']),
+    origen,
+  ];
+}
+
+// Fila de la BD → objeto con las MISMAS cabeceras de la hoja (para los consumidores).
+function grzRowToSheet(row) {
+  return {
+    id: row.id,
+    'Marca temporal': row.marca_temporal_raw || '',
+    'ASESOR REALZZA': row.asesor_realzza || '',
+    'SEDE': row.sede || '',
+    'TIPO DE BASE': row.tipo_base || '',
+    'DNI CLIENTE': row.dni_cliente || '',
+    'CELULAR GESTIONADO': row.celular_gestionado || '',
+    'ESTADO DE GESTIÓN': row.estado_gestion || '',
+    'MEDIO DE PRIMER CONTACTO': row.medio_primer_contacto || '',
+    'RESULTADO DE GESTIÓN': row.resultado_gestion || '',
+    'PRODUCTO INTERÉS': row.producto_interes || '',
+    'MOTIVO INTERÉS': row.motivo_interes || '',
+    'MOTIVO AGENDAMIENTO': row.motivo_agendamiento || '',
+    'FECHA DE INTERÉS AGENDAMIENTO': row.fecha_interes_agendamiento || '',
+    'HORA APROXIMADA INTERÉS AGENDAMIENTO': row.hora_interes_agendamiento || '',
+    'COMENTARIO ADICIONAL AGENDAMIENTO': row.comentario_agendamiento || '',
+    'FECHA DE INTERÉS DERIVACIÓN': row.fecha_interes_derivacion || '',
+    'HORA APROXIMADA INTERÉS DERIVACIÓN': row.hora_interes_derivacion || '',
+    'COMENTARIO ADICIONAL DERIVACIÓN': row.comentario_derivacion || '',
+    'MOTIVO NO INTERÉS': row.motivo_no_interes || '',
+    'COMENTARIO ADICIONAL NO INTERÉS': row.comentario_no_interes || '',
+    'MOTIVO NO ATENDIBLE': row.motivo_no_atendible || '',
+    'COMENTARIO ADICIONAL NO ATENDIBLE': row.comentario_no_atendible || '',
+    'MOTIVOS TERCERO RELACIONADO': row.motivos_tercero_relacionado || '',
+    'FECHA DE RE-LLAMADA': row.fecha_rellamada || '',
+    'HORA DE RELLAMADA': row.hora_rellamada || '',
+    'NÚMERO TITULAR ACTUAL': row.numero_titular_actual || '',
+    'MOTIVO NO CONTACTO': row.motivo_no_contacto || '',
+    'MOTIVO DE NO CIERRE': row.motivo_no_cierre || '',
+    'COMENTARIO VENTA NO CONCRETADA': row.comentario_venta_no_concretada || '',
+  };
+}
+
+// Lee la hoja de respuestas del form Realzza (campo) como objetos por cabecera.
+async function leerCampoSheet() {
+  const config = sheetsConfigs['campo'];
+  const auth = googleAuthConfigs[config.authKey];
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) return [];
+  const [headersRaw, ...data] = rows;
+  const seen = {}; const H = [];
+  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
+  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
+}
+
+// POST /gestion-realzza/sync — migra una sola vez las respuestas del form a la BD.
+app.post('/gestion-realzza/sync', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionRealzzaSchema();
+    const { rows: cnt } = await pgPool.query("SELECT COUNT(*)::int AS n FROM gestion_realzza WHERE origen = 'form'");
+    if (cnt[0].n > 0 && req.query.force !== '1') {
+      return res.json({ success: true, yaMigrado: true, existentes: cnt[0].n });
+    }
+    const data = await leerCampoSheet();
+    const filas = data.filter(r =>
+      (r['Marca temporal'] || '').toString().trim() !== '' || (r['ASESOR REALZZA'] || '').toString().trim() !== '');
+
+    const client = await pgPool.connect();
+    let insertados = 0;
+    try {
+      await client.query('BEGIN');
+      const CHUNK = 500;
+      for (let i = 0; i < filas.length; i += CHUNK) {
+        const chunk = filas.slice(i, i + CHUNK);
+        const params = [];
+        const tuples = chunk.map((r, idx) => {
+          const arr = mapRealzzaRow(r, 'form');
+          const base = idx * GRZ_COLS.length;
+          params.push(...arr);
+          return '(' + GRZ_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+        });
+        await client.query(`INSERT INTO gestion_realzza (${GRZ_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
+        insertados += chunk.length;
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+
+    res.json({ success: true, leidas: data.length, insertados });
+  } catch (e) {
+    console.error('❌ POST /gestion-realzza/sync:', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// POST /gestion-realzza — registra una gestión nueva desde la app (origen = 'app').
+app.post('/gestion-realzza', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  if (!b.asesor_realzza || !b.dni_cliente || !b.estado_gestion) {
+    return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, dni, estado de gestión).' });
+  }
+  try {
+    await ensureGestionRealzzaSchema();
+    const now = new Date();
+    const valorDe = {
+      marca_temporal: now, marca_temporal_raw: formatMarca(now), origen: 'app',
+      asesor_realzza: b.asesor_realzza, sede: b.sede || 'REALZZA', tipo_base: b.tipo_base,
+      dni_cliente: b.dni_cliente, celular_gestionado: b.celular_gestionado, estado_gestion: b.estado_gestion,
+      medio_primer_contacto: b.medio_primer_contacto, resultado_gestion: b.resultado_gestion,
+      producto_interes: b.producto_interes, motivo_interes: b.motivo_interes, motivo_agendamiento: b.motivo_agendamiento,
+      fecha_interes_agendamiento: b.fecha_interes_agendamiento, hora_interes_agendamiento: b.hora_interes_agendamiento,
+      comentario_agendamiento: b.comentario_agendamiento, fecha_interes_derivacion: b.fecha_interes_derivacion,
+      hora_interes_derivacion: b.hora_interes_derivacion, comentario_derivacion: b.comentario_derivacion,
+      motivo_no_interes: b.motivo_no_interes, comentario_no_interes: b.comentario_no_interes,
+      motivo_no_atendible: b.motivo_no_atendible, comentario_no_atendible: b.comentario_no_atendible,
+      motivos_tercero_relacionado: b.motivos_tercero_relacionado, fecha_rellamada: b.fecha_rellamada,
+      hora_rellamada: b.hora_rellamada, numero_titular_actual: b.numero_titular_actual,
+      motivo_no_contacto: b.motivo_no_contacto, motivo_no_cierre: b.motivo_no_cierre,
+      comentario_venta_no_concretada: b.comentario_venta_no_concretada,
+    };
+    const params = GRZ_COLS.map(c => {
+      const v = valorDe[c];
+      return v === undefined || v === '' ? null : v;
+    });
+    const ph = GRZ_COLS.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await pgPool.query(
+      `INSERT INTO gestion_realzza (${GRZ_COLS.join(',')}) VALUES (${ph}) RETURNING id`, params);
+    res.json({ success: true, id: rows[0].id, marca_temporal: valorDe.marca_temporal_raw });
+  } catch (e) {
+    console.error('❌ POST /gestion-realzza:', e);
+    res.status(500).json({ success: false, message: 'No se pudo guardar la gestión.' });
+  }
+});
+
+// GET /gestion-realzza?desde=&hasta= — filas con las cabeceras de la hoja.
+app.get('/gestion-realzza', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionRealzzaSchema();
+    const cond = []; const params = [];
+    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(
+      `SELECT * FROM gestion_realzza ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
+    res.json(rows.map(grzRowToSheet));
+  } catch (e) {
+    console.error('❌ GET /gestion-realzza:', e);
+    res.status(500).json({ success: false, message: 'No se pudieron obtener las gestiones.' });
+  }
+});
+
+// Mapa cabecera de hoja → columna BD (Realzza), para editar desde el grid.
+const REALZZA_SHEET_TO_COL = {
+  'ASESOR REALZZA': 'asesor_realzza', 'SEDE': 'sede', 'TIPO DE BASE': 'tipo_base', 'DNI CLIENTE': 'dni_cliente',
+  'CELULAR GESTIONADO': 'celular_gestionado', 'ESTADO DE GESTIÓN': 'estado_gestion', 'MEDIO DE PRIMER CONTACTO': 'medio_primer_contacto',
+  'RESULTADO DE GESTIÓN': 'resultado_gestion', 'PRODUCTO INTERÉS': 'producto_interes', 'MOTIVO INTERÉS': 'motivo_interes',
+  'MOTIVO AGENDAMIENTO': 'motivo_agendamiento', 'FECHA DE INTERÉS AGENDAMIENTO': 'fecha_interes_agendamiento',
+  'HORA APROXIMADA INTERÉS AGENDAMIENTO': 'hora_interes_agendamiento', 'COMENTARIO ADICIONAL AGENDAMIENTO': 'comentario_agendamiento',
+  'FECHA DE INTERÉS DERIVACIÓN': 'fecha_interes_derivacion', 'HORA APROXIMADA INTERÉS DERIVACIÓN': 'hora_interes_derivacion',
+  'COMENTARIO ADICIONAL DERIVACIÓN': 'comentario_derivacion', 'MOTIVO NO INTERÉS': 'motivo_no_interes',
+  'COMENTARIO ADICIONAL NO INTERÉS': 'comentario_no_interes', 'MOTIVO NO ATENDIBLE': 'motivo_no_atendible',
+  'COMENTARIO ADICIONAL NO ATENDIBLE': 'comentario_no_atendible', 'MOTIVOS TERCERO RELACIONADO': 'motivos_tercero_relacionado',
+  'FECHA DE RE-LLAMADA': 'fecha_rellamada', 'HORA DE RELLAMADA': 'hora_rellamada', 'NÚMERO TITULAR ACTUAL': 'numero_titular_actual',
+  'MOTIVO NO CONTACTO': 'motivo_no_contacto',
+  'MOTIVO DE NO CIERRE': 'motivo_no_cierre', 'COMENTARIO VENTA NO CONCRETADA': 'comentario_venta_no_concretada',
+};
+
+// Construye SET clause aceptando claves de hoja o snake_case (no toca marca_temporal/origen/id).
+function construirUpdate(body, sheetToCol, colsSnake) {
+  const sets = [], params = [];
+  for (const [k, v] of Object.entries(body || {})) {
+    const col = sheetToCol[k] || (colsSnake.includes(k) ? k : null);
+    if (!col || col === 'marca_temporal' || col === 'marca_temporal_raw' || col === 'origen') continue;
+    params.push(v === '' ? null : v);
+    sets.push(`${col} = $${params.length}`);
+  }
+  return { sets, params };
+}
+
+// PUT /gestion-realzza/:id — edita una gestión.
+app.put('/gestion-realzza/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionRealzzaSchema();
+    const { sets, params } = construirUpdate(req.body, REALZZA_SHEET_TO_COL, GRZ_COLS);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    params.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE gestion_realzza SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /gestion-realzza/:id', e); res.status(500).json({ success: false, message: 'No se pudo actualizar.' }); }
+});
+
+// DELETE /gestion-realzza/:id — elimina una gestión.
+app.delete('/gestion-realzza/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionRealzzaSchema();
+    const { rowCount } = await pgPool.query('DELETE FROM gestion_realzza WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /gestion-realzza/:id', e); res.status(500).json({ success: false, message: 'No se pudo eliminar.' }); }
+});
+
+// POST /gestion-realzza/match — { dnis: [...] } → { <dni>: {asesor, tipo_base, sede, celular} } (última gestión).
+app.post('/gestion-realzza/match', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionRealzzaSchema();
+    const dnis = Array.from(new Set((req.body?.dnis || []).map(d => String(d).replace(/\D/g, '').replace(/^0+/, '')).filter(Boolean)));
+    if (!dnis.length) return res.json({});
+    const { rows } = await pgPool.query(`
+      SELECT DISTINCT ON (dnin) dnin, asesor_realzza, tipo_base, sede, celular_gestionado
+      FROM (
+        SELECT regexp_replace(regexp_replace(dni_cliente, '\\D', '', 'g'), '^0+', '') AS dnin,
+               asesor_realzza, tipo_base, sede, celular_gestionado, marca_temporal
+        FROM gestion_realzza
+        WHERE regexp_replace(regexp_replace(dni_cliente, '\\D', '', 'g'), '^0+', '') = ANY($1)
+      ) t
+      ORDER BY dnin, marca_temporal DESC NULLS LAST
+    `, [dnis]);
+    const map = {};
+    rows.forEach(r => { map[r.dnin] = { asesor: r.asesor_realzza || '', tipo_base: r.tipo_base || '', sede: r.sede || '', celular: r.celular_gestionado || '' }; });
+    res.json(map);
+  } catch (e) { console.error('❌ POST /gestion-realzza/match', e); res.status(500).json({ success: false, message: 'No se pudo hacer el match.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🕵️ CONTROL DEL SUPERVISOR (Realzza) → PostgreSQL (Neon).
+// El supervisor registra su control de gestión: DNI, celular, estado (CONTACTO/NO
+// CONTACTO), comentario + asesor y tipo de base. Se cruza luego con la gestión del
+// asesor por DNI+celular para verificar si esa gestión fue supervisada.
+// ─────────────────────────────────────────────────────────────────────────────
+const CS_COLS = [
+  'marca_temporal', 'marca_temporal_raw', 'registrado_por', 'asesor', 'tipo_base',
+  'dni_cliente', 'celular', 'estado_gestion', 'comentario',
+];
+
+let csSchemaLista = false;
+async function ensureControlSupervisorSchema() {
+  if (!pgPool || csSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS control_supervisor (
+      id                 BIGSERIAL PRIMARY KEY,
+      marca_temporal     TIMESTAMP,
+      marca_temporal_raw TEXT,
+      registrado_por     TEXT,
+      asesor             TEXT,
+      tipo_base          TEXT,
+      dni_cliente        TEXT,
+      celular            TEXT,
+      estado_gestion     TEXT,
+      comentario         TEXT,
+      creado_en          TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_cs_marca  ON control_supervisor (marca_temporal);
+    CREATE INDEX IF NOT EXISTS ix_cs_asesor ON control_supervisor (asesor);
+    CREATE INDEX IF NOT EXISTS ix_cs_dni    ON control_supervisor (dni_cliente);
+  `);
+  csSchemaLista = true;
+}
+
+// Fila de la BD → objeto JSON para el frontend.
+function csRowToJson(row) {
+  return {
+    id: row.id,
+    marca_temporal: row.marca_temporal_raw || '',
+    registrado_por: row.registrado_por || '',
+    asesor: row.asesor || '',
+    tipo_base: row.tipo_base || '',
+    dni_cliente: row.dni_cliente || '',
+    celular: row.celular || '',
+    estado_gestion: row.estado_gestion || '',
+    comentario: row.comentario || '',
+  };
+}
+
+// POST /control-supervisor — registra un control del supervisor.
+app.post('/control-supervisor', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  if (!b.dni_cliente || !b.estado_gestion) {
+    return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (dni, estado de gestión).' });
+  }
+  try {
+    await ensureControlSupervisorSchema();
+    const now = new Date();
+    const valorDe = {
+      marca_temporal: now, marca_temporal_raw: formatMarca(now),
+      registrado_por: b.registrado_por, asesor: b.asesor, tipo_base: b.tipo_base,
+      dni_cliente: b.dni_cliente, celular: b.celular, estado_gestion: b.estado_gestion,
+      comentario: b.comentario,
+    };
+    const params = CS_COLS.map(c => { const v = valorDe[c]; return v === undefined || v === '' ? null : v; });
+    const ph = CS_COLS.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await pgPool.query(
+      `INSERT INTO control_supervisor (${CS_COLS.join(',')}) VALUES (${ph}) RETURNING id`, params);
+    res.json({ success: true, id: rows[0].id, marca_temporal: valorDe.marca_temporal_raw });
+  } catch (e) {
+    console.error('❌ POST /control-supervisor:', e);
+    res.status(500).json({ success: false, message: 'No se pudo guardar el control.' });
+  }
+});
+
+// GET /control-supervisor?desde=&hasta= — controles del supervisor por rango de fechas.
+app.get('/control-supervisor', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureControlSupervisorSchema();
+    const cond = []; const params = [];
+    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(
+      `SELECT * FROM control_supervisor ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
+    res.json(rows.map(csRowToJson));
+  } catch (e) {
+    console.error('❌ GET /control-supervisor:', e);
+    res.status(500).json({ success: false, message: 'No se pudieron obtener los controles.' });
+  }
+});
+
+// Mapa clave → columna BD (para editar desde el grid; no toca marca_temporal/id).
+const CS_SHEET_TO_COL = {
+  registrado_por: 'registrado_por', asesor: 'asesor', tipo_base: 'tipo_base', dni_cliente: 'dni_cliente',
+  celular: 'celular', estado_gestion: 'estado_gestion', comentario: 'comentario',
+};
+
+// PUT /control-supervisor/:id — edita un control.
+app.put('/control-supervisor/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureControlSupervisorSchema();
+    const { sets, params } = construirUpdate(req.body, CS_SHEET_TO_COL, CS_COLS);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    params.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE control_supervisor SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Control no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /control-supervisor/:id', e); res.status(500).json({ success: false, message: 'No se pudo actualizar.' }); }
+});
+
+// DELETE /control-supervisor/:id — elimina un control.
+app.delete('/control-supervisor/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureControlSupervisorSchema();
+    const { rowCount } = await pgPool.query('DELETE FROM control_supervisor WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Control no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /control-supervisor/:id', e); res.status(500).json({ success: false, message: 'No se pudo eliminar.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📞 GESTIÓN CALL CENTER → PostgreSQL (Neon). Reemplaza el Google Form de call.
+// Misma mecánica que gestión realzza (30 columnas del form + marca_temporal + origen).
+// GET devuelve las MISMAS cabeceras de la hoja /data/call.
+// ─────────────────────────────────────────────────────────────────────────────
+const GC_COLS = [
+  'marca_temporal', 'marca_temporal_raw', 'asesor_contact', 'dni_cliente', 'tipo_cliente',
+  'estado_gestion', 'medio_primer_contacto', 'celular_gestionado', 'resultado_gestion',
+  'producto_interes', 'motivo_interes', 'motivo_agendamiento', 'fecha_interes_agendamiento',
+  'hora_interes_agendamiento', 'fecha_interes_derivacion', 'hora_interes_derivacion',
+  'comentario_derivacion', 'comentario_agendamiento', 'motivo_no_interes', 'comentario_no_interes',
+  'motivo_no_atendible', 'comentario_no_atendible', 'motivos_tercero_relacionado', 'fecha_rellamada',
+  'hora_rellamada', 'numero_titular_actual', 'motivo_no_contacto', 'sede', 'kommo',
+  'motivo_no_cierre', 'comentario_venta_no_concretada', 'origen',
+];
+
+let gcSchemaLista = false;
+async function ensureGestionCallSchema() {
+  if (!pgPool || gcSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS gestion_call (
+      id                             BIGSERIAL PRIMARY KEY,
+      marca_temporal                 TIMESTAMP,
+      marca_temporal_raw             TEXT,
+      asesor_contact                 TEXT,
+      dni_cliente                    TEXT,
+      tipo_cliente                   TEXT,
+      estado_gestion                 TEXT,
+      medio_primer_contacto          TEXT,
+      celular_gestionado             TEXT,
+      resultado_gestion              TEXT,
+      producto_interes               TEXT,
+      motivo_interes                 TEXT,
+      motivo_agendamiento            TEXT,
+      fecha_interes_agendamiento     TEXT,
+      hora_interes_agendamiento      TEXT,
+      fecha_interes_derivacion       TEXT,
+      hora_interes_derivacion        TEXT,
+      comentario_derivacion          TEXT,
+      comentario_agendamiento        TEXT,
+      motivo_no_interes              TEXT,
+      comentario_no_interes          TEXT,
+      motivo_no_atendible            TEXT,
+      comentario_no_atendible        TEXT,
+      motivos_tercero_relacionado    TEXT,
+      fecha_rellamada                TEXT,
+      hora_rellamada                 TEXT,
+      numero_titular_actual          TEXT,
+      motivo_no_contacto             TEXT,
+      sede                           TEXT,
+      kommo                          TEXT,
+      motivo_no_cierre               TEXT,
+      comentario_venta_no_concretada TEXT,
+      origen                         TEXT NOT NULL DEFAULT 'app',
+      creado_en                      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_gc_marca  ON gestion_call (marca_temporal);
+    CREATE INDEX IF NOT EXISTS ix_gc_asesor ON gestion_call (asesor_contact);
+    CREATE INDEX IF NOT EXISTS ix_gc_dni    ON gestion_call (dni_cliente);
+  `);
+  gcSchemaLista = true;
+}
+
+function mapCallRow(r, origen) {
+  return [
+    parseMarcaTemporal(r['Marca temporal']), toStr(r['Marca temporal']),
+    toStr(r['ASESOR CONTACT']), toStr(r['DNI CLIENTE']), toStr(r['TIPO DE CLIENTE']), toStr(r['ESTADO DE GESTIÓN']),
+    toStr(r['MEDIO DE PRIMER CONTACTO']), toStr(r['CELULAR GESTIONADO']), toStr(r['RESULTADO DE GESTIÓN']),
+    toStr(r['PRODUCTO INTERÉS']), toStr(r['MOTIVO INTERÉS']), toStr(r['MOTIVO AGENDAMIENTO']),
+    toStr(r['FECHA DE INTERÉS AGENDAMIENTO']), toStr(r['HORA APROXIMADA INTERÉS AGENDAMIENTO']),
+    toStr(r['FECHA DE INTERÉS DERIVACIÓN']), toStr(r['HORA APROXIMADA INTERÉS DERIVACIÓN']),
+    toStr(r['COMENTARIO ADICIONAL DERIVACIÓN']), toStr(r['COMENTARIO ADICIONAL AGENDAMIENTO']),
+    toStr(r['MOTIVO NO INTERÉS']), toStr(r['COMENTARIO ADICIONAL NO INTERES']),
+    toStr(r['MOTIVO NO ATENDIBLE']), toStr(r['COMENTARIO ADICIONAL NO ATENDIBLE']),
+    toStr(r['MOTIVOS TERCERO RELACIONADO']), toStr(r['FECHA DE RE-LLAMADA']), toStr(r['HORA DE RELLAMADA']),
+    toStr(r['NÚMERO TITULAR ACTUAL']), toStr(r['MOTIVO NO CONTACTO']), toStr(r['SEDE']), toStr(r['KOMMO']),
+    toStr(r['MOTIVO DE NO CIERRE']), toStr(r['COMENTARIO VENTA NO CONCRETADA']),
+    origen,
+  ];
+}
+
+function gcRowToSheet(row) {
+  return {
+    id: row.id,
+    'Marca temporal': row.marca_temporal_raw || '',
+    'ASESOR CONTACT': row.asesor_contact || '',
+    'DNI CLIENTE': row.dni_cliente || '',
+    'TIPO DE CLIENTE': row.tipo_cliente || '',
+    'ESTADO DE GESTIÓN': row.estado_gestion || '',
+    'MEDIO DE PRIMER CONTACTO': row.medio_primer_contacto || '',
+    'CELULAR GESTIONADO': row.celular_gestionado || '',
+    'RESULTADO DE GESTIÓN': row.resultado_gestion || '',
+    'PRODUCTO INTERÉS': row.producto_interes || '',
+    'MOTIVO INTERÉS': row.motivo_interes || '',
+    'MOTIVO AGENDAMIENTO': row.motivo_agendamiento || '',
+    'FECHA DE INTERÉS AGENDAMIENTO': row.fecha_interes_agendamiento || '',
+    'HORA APROXIMADA INTERÉS AGENDAMIENTO': row.hora_interes_agendamiento || '',
+    'FECHA DE INTERÉS DERIVACIÓN': row.fecha_interes_derivacion || '',
+    'HORA APROXIMADA INTERÉS DERIVACIÓN': row.hora_interes_derivacion || '',
+    'COMENTARIO ADICIONAL DERIVACIÓN': row.comentario_derivacion || '',
+    'COMENTARIO ADICIONAL AGENDAMIENTO': row.comentario_agendamiento || '',
+    'MOTIVO NO INTERÉS': row.motivo_no_interes || '',
+    'COMENTARIO ADICIONAL NO INTERES': row.comentario_no_interes || '',
+    'MOTIVO NO ATENDIBLE': row.motivo_no_atendible || '',
+    'COMENTARIO ADICIONAL NO ATENDIBLE': row.comentario_no_atendible || '',
+    'MOTIVOS TERCERO RELACIONADO': row.motivos_tercero_relacionado || '',
+    'FECHA DE RE-LLAMADA': row.fecha_rellamada || '',
+    'HORA DE RELLAMADA': row.hora_rellamada || '',
+    'NÚMERO TITULAR ACTUAL': row.numero_titular_actual || '',
+    'MOTIVO NO CONTACTO': row.motivo_no_contacto || '',
+    'SEDE': row.sede || '',
+    'KOMMO': row.kommo || '',
+    'MOTIVO DE NO CIERRE': row.motivo_no_cierre || '',
+    'COMENTARIO VENTA NO CONCRETADA': row.comentario_venta_no_concretada || '',
+  };
+}
+
+async function leerCallSheet() {
+  const config = sheetsConfigs['call'];
+  const auth = googleAuthConfigs[config.authKey];
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) return [];
+  const [headersRaw, ...data] = rows;
+  const seen = {}; const H = [];
+  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
+  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
+}
+
+app.post('/gestion-call/sync', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionCallSchema();
+    const { rows: cnt } = await pgPool.query("SELECT COUNT(*)::int AS n FROM gestion_call WHERE origen = 'form'");
+    if (cnt[0].n > 0 && req.query.force !== '1') return res.json({ success: true, yaMigrado: true, existentes: cnt[0].n });
+    const data = await leerCallSheet();
+    const filas = data.filter(r =>
+      (r['Marca temporal'] || '').toString().trim() !== '' || (r['ASESOR CONTACT'] || '').toString().trim() !== '');
+    const client = await pgPool.connect();
+    let insertados = 0;
+    try {
+      await client.query('BEGIN');
+      const CHUNK = 500;
+      for (let i = 0; i < filas.length; i += CHUNK) {
+        const chunk = filas.slice(i, i + CHUNK);
+        const params = [];
+        const tuples = chunk.map((r, idx) => {
+          const arr = mapCallRow(r, 'form');
+          const base = idx * GC_COLS.length;
+          params.push(...arr);
+          return '(' + GC_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+        });
+        await client.query(`INSERT INTO gestion_call (${GC_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
+        insertados += chunk.length;
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    res.json({ success: true, leidas: data.length, insertados });
+  } catch (e) { console.error('❌ POST /gestion-call/sync:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.post('/gestion-call', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  if (!b.asesor_contact || !b.dni_cliente || !b.estado_gestion) {
+    return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, dni, estado de gestión).' });
+  }
+  try {
+    await ensureGestionCallSchema();
+    const now = new Date();
+    const valorDe = {
+      marca_temporal: now, marca_temporal_raw: formatMarca(now), origen: 'app',
+      asesor_contact: b.asesor_contact, dni_cliente: b.dni_cliente, tipo_cliente: b.tipo_cliente,
+      estado_gestion: b.estado_gestion, medio_primer_contacto: b.medio_primer_contacto,
+      celular_gestionado: b.celular_gestionado, resultado_gestion: b.resultado_gestion,
+      producto_interes: b.producto_interes, motivo_interes: b.motivo_interes, motivo_agendamiento: b.motivo_agendamiento,
+      fecha_interes_agendamiento: b.fecha_interes_agendamiento, hora_interes_agendamiento: b.hora_interes_agendamiento,
+      fecha_interes_derivacion: b.fecha_interes_derivacion, hora_interes_derivacion: b.hora_interes_derivacion,
+      comentario_derivacion: b.comentario_derivacion, comentario_agendamiento: b.comentario_agendamiento,
+      motivo_no_interes: b.motivo_no_interes, comentario_no_interes: b.comentario_no_interes,
+      motivo_no_atendible: b.motivo_no_atendible, comentario_no_atendible: b.comentario_no_atendible,
+      motivos_tercero_relacionado: b.motivos_tercero_relacionado, fecha_rellamada: b.fecha_rellamada,
+      hora_rellamada: b.hora_rellamada, numero_titular_actual: b.numero_titular_actual,
+      motivo_no_contacto: b.motivo_no_contacto, sede: b.sede, kommo: b.kommo,
+      motivo_no_cierre: b.motivo_no_cierre, comentario_venta_no_concretada: b.comentario_venta_no_concretada,
+    };
+    const params = GC_COLS.map(c => { const v = valorDe[c]; return v === undefined || v === '' ? null : v; });
+    const ph = GC_COLS.map((_, i) => `$${i + 1}`).join(',');
+    const { rows } = await pgPool.query(`INSERT INTO gestion_call (${GC_COLS.join(',')}) VALUES (${ph}) RETURNING id`, params);
+    res.json({ success: true, id: rows[0].id, marca_temporal: valorDe.marca_temporal_raw });
+  } catch (e) { console.error('❌ POST /gestion-call:', e); res.status(500).json({ success: false, message: 'No se pudo guardar la gestión.' }); }
+});
+
+app.get('/gestion-call', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionCallSchema();
+    const cond = []; const params = [];
+    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(`SELECT * FROM gestion_call ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
+    res.json(rows.map(gcRowToSheet));
+  } catch (e) { console.error('❌ GET /gestion-call:', e); res.status(500).json({ success: false, message: 'No se pudieron obtener las gestiones.' }); }
+});
+
+// Mapa cabecera de hoja → columna BD (Call), para editar desde el grid.
+const CALL_SHEET_TO_COL = {
+  'ASESOR CONTACT': 'asesor_contact', 'DNI CLIENTE': 'dni_cliente', 'TIPO DE CLIENTE': 'tipo_cliente',
+  'ESTADO DE GESTIÓN': 'estado_gestion', 'MEDIO DE PRIMER CONTACTO': 'medio_primer_contacto', 'CELULAR GESTIONADO': 'celular_gestionado',
+  'RESULTADO DE GESTIÓN': 'resultado_gestion', 'PRODUCTO INTERÉS': 'producto_interes', 'MOTIVO INTERÉS': 'motivo_interes',
+  'MOTIVO AGENDAMIENTO': 'motivo_agendamiento', 'FECHA DE INTERÉS AGENDAMIENTO': 'fecha_interes_agendamiento',
+  'HORA APROXIMADA INTERÉS AGENDAMIENTO': 'hora_interes_agendamiento', 'FECHA DE INTERÉS DERIVACIÓN': 'fecha_interes_derivacion',
+  'HORA APROXIMADA INTERÉS DERIVACIÓN': 'hora_interes_derivacion', 'COMENTARIO ADICIONAL DERIVACIÓN': 'comentario_derivacion',
+  'COMENTARIO ADICIONAL AGENDAMIENTO': 'comentario_agendamiento', 'MOTIVO NO INTERÉS': 'motivo_no_interes',
+  'COMENTARIO ADICIONAL NO INTERES': 'comentario_no_interes', 'MOTIVO NO ATENDIBLE': 'motivo_no_atendible',
+  'COMENTARIO ADICIONAL NO ATENDIBLE': 'comentario_no_atendible', 'MOTIVOS TERCERO RELACIONADO': 'motivos_tercero_relacionado',
+  'FECHA DE RE-LLAMADA': 'fecha_rellamada', 'HORA DE RELLAMADA': 'hora_rellamada', 'NÚMERO TITULAR ACTUAL': 'numero_titular_actual',
+  'MOTIVO NO CONTACTO': 'motivo_no_contacto', 'SEDE': 'sede', 'KOMMO': 'kommo',
+  'MOTIVO DE NO CIERRE': 'motivo_no_cierre', 'COMENTARIO VENTA NO CONCRETADA': 'comentario_venta_no_concretada',
+};
+
+// PUT /gestion-call/:id — edita una gestión.
+app.put('/gestion-call/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionCallSchema();
+    const { sets, params } = construirUpdate(req.body, CALL_SHEET_TO_COL, GC_COLS);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    params.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE gestion_call SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /gestion-call/:id', e); res.status(500).json({ success: false, message: 'No se pudo actualizar.' }); }
+});
+
+// DELETE /gestion-call/:id — elimina una gestión.
+app.delete('/gestion-call/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionCallSchema();
+    const { rowCount } = await pgPool.query('DELETE FROM gestion_call WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /gestion-call/:id', e); res.status(500).json({ success: false, message: 'No se pudo eliminar.' }); }
+});
+
+// POST /gestion-call/match — { dnis: [...] } → { <dni>: {asesor, tipo_cliente, sede, kommo, celular} }
+// Devuelve la ÚLTIMA gestión Call de cada DNI (para atribuir las ventas del Excel).
+app.post('/gestion-call/match', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionCallSchema();
+    const dnis = Array.from(new Set((req.body?.dnis || []).map(d => String(d).replace(/\D/g, '').replace(/^0+/, '')).filter(Boolean)));
+    if (!dnis.length) return res.json({});
+    const { rows } = await pgPool.query(`
+      SELECT DISTINCT ON (dnin) dnin, asesor_contact, tipo_cliente, sede, kommo, celular_gestionado
+      FROM (
+        SELECT regexp_replace(regexp_replace(dni_cliente, '\\D', '', 'g'), '^0+', '') AS dnin,
+               asesor_contact, tipo_cliente, sede, kommo, celular_gestionado, marca_temporal
+        FROM gestion_call
+        WHERE regexp_replace(regexp_replace(dni_cliente, '\\D', '', 'g'), '^0+', '') = ANY($1)
+      ) t
+      ORDER BY dnin, marca_temporal DESC NULLS LAST
+    `, [dnis]);
+    const map = {};
+    rows.forEach(r => { map[r.dnin] = { asesor: r.asesor_contact || '', tipo_cliente: r.tipo_cliente || '', sede: r.sede || '', kommo: r.kommo || '', celular: r.celular_gestionado || '' }; });
+    res.json(map);
+  } catch (e) { console.error('❌ POST /gestion-call/match', e); res.status(500).json({ success: false, message: 'No se pudo hacer el match.' }); }
+});
+
 // Iniciar servidor
 app.listen(PORT, () => {
   console.log(`✅ API corriendo en http://localhost:${PORT}`);
-  Promise.all([ensureVentasSchema(), ensureMargenSchema()])
-    .then(() => pgPool && console.log('🐘 Esquemas de ventas y margen verificados.'))
+  Promise.all([ensureVentasSchema(), ensureMargenSchema(), ensureUsuariosSchema(), ensurePermisosSchema(), ensureGestionRealzzaSchema(), ensureGestionCallSchema()])
+    .then(async () => {
+      if (!pgPool) return;
+      console.log('🐘 Esquemas verificados (ventas, margen, usuarios, permisos, gestión realzza, gestión call).');
+      await migrarUsuariosDesdeSheet();
+    })
     .catch((e) => console.error('❌ No se pudo verificar el esquema:', e));
 });
