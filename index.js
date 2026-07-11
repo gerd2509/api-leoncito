@@ -1110,6 +1110,25 @@ function formatMarca(d) {
   return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()} ${d.getHours()}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+// Fecha/hora actual en Perú (America/Lima, UTC-5) SIN depender de la zona del
+// servidor (en Render es UTC → +5h). Devuelve:
+//  - ts:  'yyyy-mm-dd HH:mm:ss'  para la columna TIMESTAMP (se guarda tal cual).
+//  - raw: 'd/m/yyyy H:mm:ss'     mismo formato que formatMarca (marca_temporal_raw).
+function ahoraLima() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Lima',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const p = {};
+  for (const x of parts) if (x.type !== 'literal') p[x.type] = x.value;
+  const hh = p.hour === '24' ? '00' : p.hour;   // Intl a veces da '24' a medianoche
+  return {
+    ts: `${p.year}-${p.month}-${p.day} ${hh}:${p.minute}:${p.second}`,
+    raw: `${+p.day}/${+p.month}/${+p.year} ${+hh}:${p.minute}:${p.second}`,
+  };
+}
+
 // Fila de la hoja (objeto por cabecera) → arreglo en el orden de GRZ_COLS.
 function mapRealzzaRow(r, origen) {
   return [
@@ -1229,9 +1248,9 @@ app.post('/gestion-realzza', async (req, res) => {
   }
   try {
     await ensureGestionRealzzaSchema();
-    const now = new Date();
+    const t = ahoraLima();
     const valorDe = {
-      marca_temporal: now, marca_temporal_raw: formatMarca(now), origen: 'app',
+      marca_temporal: t.ts, marca_temporal_raw: t.raw, origen: 'app',
       asesor_realzza: b.asesor_realzza, sede: b.sede || 'REALZZA', tipo_base: b.tipo_base,
       dni_cliente: b.dni_cliente, celular_gestionado: b.celular_gestionado, estado_gestion: b.estado_gestion,
       medio_primer_contacto: b.medio_primer_contacto, resultado_gestion: b.resultado_gestion,
@@ -1413,9 +1432,9 @@ app.post('/control-supervisor', async (req, res) => {
   }
   try {
     await ensureControlSupervisorSchema();
-    const now = new Date();
+    const t = ahoraLima();
     const valorDe = {
-      marca_temporal: now, marca_temporal_raw: formatMarca(now),
+      marca_temporal: t.ts, marca_temporal_raw: t.raw,
       registrado_por: b.registrado_por, asesor: b.asesor, tipo_base: b.tipo_base,
       dni_cliente: b.dni_cliente, celular: b.celular, estado_gestion: b.estado_gestion,
       comentario: b.comentario,
@@ -1651,9 +1670,9 @@ app.post('/gestion-call', async (req, res) => {
   }
   try {
     await ensureGestionCallSchema();
-    const now = new Date();
+    const t = ahoraLima();
     const valorDe = {
-      marca_temporal: now, marca_temporal_raw: formatMarca(now), origen: 'app',
+      marca_temporal: t.ts, marca_temporal_raw: t.raw, origen: 'app',
       asesor_contact: b.asesor_contact, dni_cliente: b.dni_cliente, tipo_cliente: b.tipo_cliente,
       estado_gestion: b.estado_gestion, medio_primer_contacto: b.medio_primer_contacto,
       celular_gestionado: b.celular_gestionado, resultado_gestion: b.resultado_gestion,
