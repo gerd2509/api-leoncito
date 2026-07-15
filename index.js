@@ -11,7 +11,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+// Límite alto porque el control del supervisor puede traer fotos en base64.
+app.use(express.json({ limit: '20mb' }));
 
 // 🐘 PostgreSQL (Neon) — para el formulario de registro de gestión.
 // La cadena vive en la variable de entorno DATABASE_URL (nunca en el código).
@@ -1380,8 +1381,8 @@ app.post('/gestion-realzza/match', async (req, res) => {
 // asesor por DNI+celular para verificar si esa gestión fue supervisada.
 // ─────────────────────────────────────────────────────────────────────────────
 const CS_COLS = [
-  'marca_temporal', 'marca_temporal_raw', 'registrado_por', 'asesor', 'tipo_base',
-  'dni_cliente', 'celular', 'estado_gestion', 'comentario',
+  'marca_temporal', 'marca_temporal_raw', 'registrado_por', 'tipo_control', 'asesor', 'tipo_base',
+  'dni_cliente', 'celular', 'estado_gestion', 'fecha_publicacion', 'estado_mp', 'comentario', 'fotos',
 ];
 
 let csSchemaLista = false;
@@ -1393,14 +1394,23 @@ async function ensureControlSupervisorSchema() {
       marca_temporal     TIMESTAMP,
       marca_temporal_raw TEXT,
       registrado_por     TEXT,
+      tipo_control       TEXT NOT NULL DEFAULT 'GESTION',
       asesor             TEXT,
       tipo_base          TEXT,
       dni_cliente        TEXT,
       celular            TEXT,
       estado_gestion     TEXT,
+      fecha_publicacion  TEXT,
+      estado_mp          TEXT,
       comentario         TEXT,
+      fotos              TEXT,
       creado_en          TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Migración para tablas que ya existían (control de gestión previo).
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS tipo_control      TEXT NOT NULL DEFAULT 'GESTION';
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS fecha_publicacion TEXT;
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS estado_mp         TEXT;
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS fotos             TEXT;
     CREATE INDEX IF NOT EXISTS ix_cs_marca  ON control_supervisor (marca_temporal);
     CREATE INDEX IF NOT EXISTS ix_cs_asesor ON control_supervisor (asesor);
     CREATE INDEX IF NOT EXISTS ix_cs_dni    ON control_supervisor (dni_cliente);
@@ -1414,20 +1424,35 @@ function csRowToJson(row) {
     id: row.id,
     marca_temporal: row.marca_temporal_raw || '',
     registrado_por: row.registrado_por || '',
+    tipo_control: row.tipo_control || 'GESTION',
     asesor: row.asesor || '',
     tipo_base: row.tipo_base || '',
     dni_cliente: row.dni_cliente || '',
     celular: row.celular || '',
     estado_gestion: row.estado_gestion || '',
+    fecha_publicacion: row.fecha_publicacion || '',
+    estado_mp: row.estado_mp || '',
     comentario: row.comentario || '',
+    fotos: parseFotos(row.fotos),
   };
 }
 
-// POST /control-supervisor — registra un control del supervisor.
+// La columna `fotos` guarda un JSON array de data-URIs base64.
+function parseFotos(v) {
+  if (!v) return [];
+  try { const a = JSON.parse(v); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+
+// POST /control-supervisor — registra un control del supervisor (gestión o market place).
 app.post('/control-supervisor', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   const b = req.body || {};
-  if (!b.dni_cliente || !b.estado_gestion) {
+  const tipo = (b.tipo_control || 'GESTION').toString().toUpperCase();
+  if (tipo === 'MARKET_PLACE') {
+    if (!b.asesor || !b.estado_mp) {
+      return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, estado de publicación).' });
+    }
+  } else if (!b.dni_cliente || !b.estado_gestion) {
     return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (dni, estado de gestión).' });
   }
   try {
@@ -1435,9 +1460,11 @@ app.post('/control-supervisor', async (req, res) => {
     const t = ahoraLima();
     const valorDe = {
       marca_temporal: t.ts, marca_temporal_raw: t.raw,
-      registrado_por: b.registrado_por, asesor: b.asesor, tipo_base: b.tipo_base,
+      registrado_por: b.registrado_por, tipo_control: tipo, asesor: b.asesor, tipo_base: b.tipo_base,
       dni_cliente: b.dni_cliente, celular: b.celular, estado_gestion: b.estado_gestion,
+      fecha_publicacion: b.fecha_publicacion, estado_mp: b.estado_mp,
       comentario: b.comentario,
+      fotos: (Array.isArray(b.fotos) && b.fotos.length) ? JSON.stringify(b.fotos) : null,
     };
     const params = CS_COLS.map(c => { const v = valorDe[c]; return v === undefined || v === '' ? null : v; });
     const ph = CS_COLS.map((_, i) => `$${i + 1}`).join(',');
@@ -1470,8 +1497,9 @@ app.get('/control-supervisor', async (req, res) => {
 
 // Mapa clave → columna BD (para editar desde el grid; no toca marca_temporal/id).
 const CS_SHEET_TO_COL = {
-  registrado_por: 'registrado_por', asesor: 'asesor', tipo_base: 'tipo_base', dni_cliente: 'dni_cliente',
-  celular: 'celular', estado_gestion: 'estado_gestion', comentario: 'comentario',
+  registrado_por: 'registrado_por', tipo_control: 'tipo_control', asesor: 'asesor', tipo_base: 'tipo_base',
+  dni_cliente: 'dni_cliente', celular: 'celular', estado_gestion: 'estado_gestion',
+  fecha_publicacion: 'fecha_publicacion', estado_mp: 'estado_mp', comentario: 'comentario',
 };
 
 // PUT /control-supervisor/:id — edita un control.
