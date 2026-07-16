@@ -1382,7 +1382,8 @@ app.post('/gestion-realzza/match', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const CS_COLS = [
   'marca_temporal', 'marca_temporal_raw', 'registrado_por', 'tipo_control', 'asesor', 'tipo_base',
-  'dni_cliente', 'celular', 'estado_gestion', 'fecha_publicacion', 'estado_mp', 'comentario', 'fotos',
+  'dni_cliente', 'celular', 'estado_gestion', 'fecha_publicacion', 'estado_mp',
+  'mp_subtipo', 'cliente', 'estado_lead', 'comentario', 'fotos',
 ];
 
 let csSchemaLista = false;
@@ -1402,6 +1403,9 @@ async function ensureControlSupervisorSchema() {
       estado_gestion     TEXT,
       fecha_publicacion  TEXT,
       estado_mp          TEXT,
+      mp_subtipo         TEXT,
+      cliente            TEXT,
+      estado_lead        TEXT,
       comentario         TEXT,
       fotos              TEXT,
       creado_en          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1410,6 +1414,9 @@ async function ensureControlSupervisorSchema() {
     ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS tipo_control      TEXT NOT NULL DEFAULT 'GESTION';
     ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS fecha_publicacion TEXT;
     ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS estado_mp         TEXT;
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS mp_subtipo        TEXT;
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS cliente           TEXT;
+    ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS estado_lead       TEXT;
     ALTER TABLE control_supervisor ADD COLUMN IF NOT EXISTS fotos             TEXT;
     CREATE INDEX IF NOT EXISTS ix_cs_marca  ON control_supervisor (marca_temporal);
     CREATE INDEX IF NOT EXISTS ix_cs_asesor ON control_supervisor (asesor);
@@ -1432,6 +1439,9 @@ function csRowToJson(row) {
     estado_gestion: row.estado_gestion || '',
     fecha_publicacion: row.fecha_publicacion || '',
     estado_mp: row.estado_mp || '',
+    mp_subtipo: row.mp_subtipo || '',
+    cliente: row.cliente || '',
+    estado_lead: row.estado_lead || '',
     comentario: row.comentario || '',
     fotos: parseFotos(row.fotos),
   };
@@ -1449,7 +1459,12 @@ app.post('/control-supervisor', async (req, res) => {
   const b = req.body || {};
   const tipo = (b.tipo_control || 'GESTION').toString().toUpperCase();
   if (tipo === 'MARKET_PLACE') {
-    if (!b.asesor || !b.estado_mp) {
+    const sub = (b.mp_subtipo || 'MARKET PLACE').toString().toUpperCase();
+    if (sub === 'KOMMO PLATAFORMA') {
+      if (!b.asesor || !b.estado_lead) {
+        return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, estado del lead).' });
+      }
+    } else if (!b.asesor || !b.estado_mp) {
       return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, estado de publicación).' });
     }
   } else if (!b.dni_cliente || !b.estado_gestion) {
@@ -1463,6 +1478,7 @@ app.post('/control-supervisor', async (req, res) => {
       registrado_por: b.registrado_por, tipo_control: tipo, asesor: b.asesor, tipo_base: b.tipo_base,
       dni_cliente: b.dni_cliente, celular: b.celular, estado_gestion: b.estado_gestion,
       fecha_publicacion: b.fecha_publicacion, estado_mp: b.estado_mp,
+      mp_subtipo: b.mp_subtipo, cliente: b.cliente, estado_lead: b.estado_lead,
       comentario: b.comentario,
       fotos: (Array.isArray(b.fotos) && b.fotos.length) ? JSON.stringify(b.fotos) : null,
     };
