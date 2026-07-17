@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+dist
+# Secretos: NO deben ir dentro de la imagen (se montan/inyectan en runtime).
+.env
+.env.*
+ffvv-realzza-campo-07c3f6b5b98f.json
+northern-cubist-454520-q8-999e42042598.json
+northern-cubist-454520-q8-1292a8b77330.json
