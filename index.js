@@ -1515,7 +1515,8 @@ app.get('/control-supervisor', async (req, res) => {
 const CS_SHEET_TO_COL = {
   registrado_por: 'registrado_por', tipo_control: 'tipo_control', asesor: 'asesor', tipo_base: 'tipo_base',
   dni_cliente: 'dni_cliente', celular: 'celular', estado_gestion: 'estado_gestion',
-  fecha_publicacion: 'fecha_publicacion', estado_mp: 'estado_mp', comentario: 'comentario',
+  fecha_publicacion: 'fecha_publicacion', estado_mp: 'estado_mp',
+  mp_subtipo: 'mp_subtipo', cliente: 'cliente', estado_lead: 'estado_lead', comentario: 'comentario',
 };
 
 // PUT /control-supervisor/:id — edita un control.
