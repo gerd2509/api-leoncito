@@ -222,7 +222,7 @@ app.post('/auth/login', async (req, res) => {
     if (!ok) {
       return res.status(401).json({ success: false, message: 'Credenciales inválidas o usuario inactivo.' });
     }
-    res.json({ success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '' });
+    res.json({ success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '', vendedor: u.vendedor || '', canal: u.canal || '' });
   } catch (error) {
     console.error('❌ Error en /auth/login:', error);
     res.status(500).json({ success: false, message: 'Error al autenticar.' });
@@ -375,6 +375,9 @@ async function ensureUsuariosSchema() {
       creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
       actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Identidad del vendedor (para "Mi Panel"): su nombre exacto + canal (sede/call/realzza).
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS vendedor TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS canal    TEXT;
   `);
   usuariosSchemaLista = true;
 }
@@ -422,7 +425,7 @@ app.get('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const { rows } = await pgPool.query(
-      'SELECT id, usuario, nombre, rol, sede, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+      'SELECT id, usuario, nombre, rol, sede, vendedor, canal, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
     );
     res.json(rows);
   } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
@@ -439,11 +442,13 @@ app.post('/usuarios', async (req, res) => {
     await ensureUsuariosSchema();
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pgPool.query(
-      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, activo)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING id, usuario, nombre, rol, sede, activo`,
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, activo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, activo`,
       [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
-       (b.sede || '').toString().trim(), b.activo !== false]
+       (b.sede || '').toString().trim(),
+       (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
+       b.activo !== false]
     );
     res.json({ success: true, usuario: rows[0] });
   } catch (e) {
@@ -461,9 +466,11 @@ app.put('/usuarios/:id', async (req, res) => {
   if (!usuario) return res.status(400).json({ success: false, message: 'El usuario es obligatorio.' });
   try {
     await ensureUsuariosSchema();
-    const campos = ['usuario = $2', 'nombre = $3', 'rol = $4', 'sede = $5', 'activo = $6', 'actualizado_en = now()'];
+    const campos = ['usuario = $2', 'nombre = $3', 'rol = $4', 'sede = $5', 'activo = $6',
+                    'vendedor = $7', 'canal = $8', 'actualizado_en = now()'];
     const params = [id, usuario, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
-                    (b.sede || '').toString().trim(), b.activo !== false];
+                    (b.sede || '').toString().trim(), b.activo !== false,
+                    (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null];
     if (b.password && b.password.toString().trim() !== '') {
       const hash = await bcrypt.hash(b.password.toString(), 10);
       params.push(hash);
@@ -471,7 +478,7 @@ app.put('/usuarios/:id', async (req, res) => {
     }
     const { rows } = await pgPool.query(
       `UPDATE usuarios SET ${campos.join(', ')} WHERE id = $1
-       RETURNING id, usuario, nombre, rol, sede, activo`, params
+       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, activo`, params
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     res.json({ success: true, usuario: rows[0] });
