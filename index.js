@@ -233,6 +233,17 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
+// GET /auth/marca?usuario=... — sede del usuario (sin contraseña) para personalizar el branding del login.
+app.get('/auth/marca', async (req, res) => {
+  const usuario = (req.query.usuario || '').toString().trim();
+  if (!pgPool || !usuario) return res.json({});
+  try {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query('SELECT sede FROM usuarios WHERE lower(usuario) = lower($1) LIMIT 1', [usuario]);
+    res.json({ sede: rows[0] ? (rows[0].sede || '') : '' });
+  } catch (e) { console.error('❌ /auth/marca:', e.message); res.json({}); }
+});
+
 // Registro de gestión (POST /gestion) → movido a gestion-service (:4004).
 
 // ─────────────────────────────────────────────────────────────────────────────
