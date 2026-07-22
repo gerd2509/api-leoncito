@@ -222,7 +222,11 @@ app.post('/auth/login', async (req, res) => {
     if (!ok) {
       return res.status(401).json({ success: false, message: 'Credenciales inválidas o usuario inactivo.' });
     }
-    res.json({ success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '', vendedor: u.vendedor || '', canal: u.canal || '' });
+    res.json({
+      success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
+      vendedor: u.vendedor || '', canal: u.canal || '',
+      modulos: Array.isArray(u.modulos) ? u.modulos : null,   // null = usa default por rol-perfil
+    });
   } catch (error) {
     console.error('❌ Error en /auth/login:', error);
     res.status(500).json({ success: false, message: 'Error al autenticar.' });
@@ -378,6 +382,8 @@ async function ensureUsuariosSchema() {
     -- Identidad del vendedor (para "Mi Panel"): su nombre exacto + canal (sede/call/realzza).
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS vendedor TEXT;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS canal    TEXT;
+    -- Permisos POR USUARIO: lista de módulos (JSONB). NULL = usa el default por rol-perfil.
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS modulos  JSONB;
   `);
   usuariosSchemaLista = true;
 }
@@ -425,7 +431,7 @@ app.get('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const { rows } = await pgPool.query(
-      'SELECT id, usuario, nombre, rol, sede, vendedor, canal, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+      'SELECT id, usuario, nombre, rol, sede, vendedor, canal, modulos, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
     );
     res.json(rows);
   } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
@@ -441,14 +447,15 @@ app.post('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const hash = await bcrypt.hash(password, 10);
+    const modulos = Array.isArray(b.modulos) ? JSON.stringify(b.modulos) : null;
     const { rows } = await pgPool.query(
-      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, activo)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, activo`,
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, activo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, modulos, activo`,
       [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
        (b.sede || '').toString().trim(),
        (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
-       b.activo !== false]
+       modulos, b.activo !== false]
     );
     res.json({ success: true, usuario: rows[0] });
   } catch (e) {
@@ -501,6 +508,21 @@ app.patch('/usuarios/:id/estado', async (req, res) => {
     if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     res.json({ success: true, usuario: rows[0] });
   } catch (e) { console.error('❌ PATCH /usuarios/:id/estado', e); res.status(500).json({ success: false, message: 'No se pudo cambiar el estado.' }); }
+});
+
+// PATCH /usuarios/:id/modulos — permisos POR USUARIO (lista de módulos). null = usa default rol-perfil.
+app.patch('/usuarios/:id/modulos', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const id = parseInt(req.params.id, 10);
+  const modulos = Array.isArray(req.body && req.body.modulos) ? JSON.stringify(req.body.modulos) : null;
+  try {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query(
+      'UPDATE usuarios SET modulos = $2::jsonb, actualizado_en = now() WHERE id = $1 RETURNING id, usuario, modulos', [id, modulos]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
+    res.json({ success: true, usuario: rows[0] });
+  } catch (e) { console.error('❌ PATCH /usuarios/:id/modulos', e); res.status(500).json({ success: false, message: 'No se pudieron guardar los permisos.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
