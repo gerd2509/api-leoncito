@@ -224,6 +224,8 @@ app.post('/auth/login', async (req, res) => {
     }
     res.json({
       success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
+      // Sedes asignadas (varias). Si no hay lista, cae a [sede] para compatibilidad.
+      sedes: Array.isArray(u.sedes) && u.sedes.length ? u.sedes : (u.sede ? [u.sede] : []),
       vendedor: u.vendedor || '', canal: u.canal || '',
       modulos: Array.isArray(u.modulos) ? u.modulos : null,   // null = usa default por rol-perfil
     });
@@ -393,6 +395,7 @@ async function ensureUsuariosSchema() {
     -- Identidad del vendedor (para "Mi Panel"): su nombre exacto + canal (sede/call/realzza).
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS vendedor TEXT;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS canal    TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sedes    JSONB;
     -- Permisos POR USUARIO: lista de módulos (JSONB). NULL = usa el default por rol-perfil.
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS modulos  JSONB;
   `);
@@ -442,7 +445,7 @@ app.get('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const { rows } = await pgPool.query(
-      'SELECT id, usuario, nombre, rol, sede, vendedor, canal, modulos, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+      'SELECT id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
     );
     res.json(rows);
   } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
@@ -459,14 +462,17 @@ app.post('/usuarios', async (req, res) => {
     await ensureUsuariosSchema();
     const hash = await bcrypt.hash(password, 10);
     const modulos = Array.isArray(b.modulos) ? JSON.stringify(b.modulos) : null;
+    const sedesArr = Array.isArray(b.sedes) ? b.sedes.filter(Boolean) : [];
+    const sedesJson = sedesArr.length ? JSON.stringify(sedesArr) : null;
+    const sedePrincipal = ((b.sede || '').toString().trim()) || sedesArr[0] || '';
     const { rows } = await pgPool.query(
-      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, activo)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
-       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, modulos, activo`,
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10)
+       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo`,
       [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
-       (b.sede || '').toString().trim(),
+       sedePrincipal,
        (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
-       modulos, b.activo !== false]
+       modulos, sedesJson, b.activo !== false]
     );
     res.json({ success: true, usuario: rows[0] });
   } catch (e) {
@@ -484,11 +490,15 @@ app.put('/usuarios/:id', async (req, res) => {
   if (!usuario) return res.status(400).json({ success: false, message: 'El usuario es obligatorio.' });
   try {
     await ensureUsuariosSchema();
+    const sedesArr = Array.isArray(b.sedes) ? b.sedes.filter(Boolean) : [];
+    const sedesJson = sedesArr.length ? JSON.stringify(sedesArr) : null;
+    const sedePrincipal = ((b.sede || '').toString().trim()) || sedesArr[0] || '';
     const campos = ['usuario = $2', 'nombre = $3', 'rol = $4', 'sede = $5', 'activo = $6',
-                    'vendedor = $7', 'canal = $8', 'actualizado_en = now()'];
+                    'vendedor = $7', 'canal = $8', 'sedes = $9::jsonb', 'actualizado_en = now()'];
     const params = [id, usuario, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
-                    (b.sede || '').toString().trim(), b.activo !== false,
-                    (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null];
+                    sedePrincipal, b.activo !== false,
+                    (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
+                    sedesJson];
     if (b.password && b.password.toString().trim() !== '') {
       const hash = await bcrypt.hash(b.password.toString(), 10);
       params.push(hash);
@@ -496,7 +506,7 @@ app.put('/usuarios/:id', async (req, res) => {
     }
     const { rows } = await pgPool.query(
       `UPDATE usuarios SET ${campos.join(', ')} WHERE id = $1
-       RETURNING id, usuario, nombre, rol, sede, vendedor, canal, activo`, params
+       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, activo`, params
     );
     if (!rows.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     res.json({ success: true, usuario: rows[0] });
