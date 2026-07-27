@@ -104,7 +104,7 @@ const sheetsConfigs = {
   },
   // CAP de asesores por sede (no es un formulario: es una hoja normal).
   // Se lee de la pestaña "CAP", cuya fila 1 son las cabeceras
-  // (VENDEDOR, SEDE, SUPERVISOR, GERENTE DE TIENDA, ZONA, CANAL, ESTADO, TIPO AV).
+  // (VENDEDOR, SEDE, SUPERVISOR, GERENTE DE TIENDA, ZONA, CANAL, ESTADO, DNI).
   capSedes: {
     authKey: 'claveUnica',
     spreadsheetId: '1_mp6v9g6BfWZ4Otbmv2PTcmkicCqq9fhbAihR0CdHgQ',
