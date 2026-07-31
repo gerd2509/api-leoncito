@@ -174,20 +174,22 @@ app.get('/data/:sheetName', async (req, res) => {
         }
       });
 
-      // Transformar filas a JSON (mutación directa: evita el spread O(cols²)).
-      const jsonDataFull = data.map((row) =>
-        headers.reduce((acc, header, i) => {
-          acc[header] = row[i] || '';
-          return acc;
-        }, {})
-      );
-
-      cached = { ts: ahora, headers, jsonData: jsonDataFull };
+      // Se cachean las filas EN CRUDO (array de arrays, ~igual que el payload) y
+      // NO el JSON expandido: en objetos por fila la hoja pesa ~7× más en memoria
+      // (30k+ objetos), lo que en el plan Free (512MB) causaba OOM. La expansión a
+      // JSON se hace por request (transitoria, se libera al responder).
+      cached = { ts: ahora, headers, data };
       sheetCache.set(sheetName, cached);
     }
 
     const headers = cached.headers;
-    let jsonData = cached.jsonData;   // filtrar NO muta el cache (filter crea copia)
+    // Expandir a JSON en cada request (mutación directa: evita el spread O(cols²)).
+    let jsonData = cached.data.map((row) =>
+      headers.reduce((acc, header, i) => {
+        acc[header] = row[i] || '';
+        return acc;
+      }, {})
+    );
 
     // 🔎 Filtro opcional por fecha (evita traer todo el histórico: p.ej. /data/sedes?desde=2026-07-01&hasta=2026-07-31)
     // Se filtra por la columna de fecha del sheet ("Marca temporal" o "Timestamp"),
