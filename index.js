@@ -128,6 +128,33 @@ const sheetsConfigs = {
 const SHEET_CACHE_TTL_MS = parseInt(process.env.SHEET_CACHE_TTL_MS || '180000', 10);
 const sheetCache = new Map(); // sheetName -> { ts, headers, jsonData }
 
+// Descarga una hoja en LOTES de filas (varias llamadas chicas) en vez de una sola
+// petición gigante: así el JSON de Google que parsea Node es pequeño en cada paso y
+// se evita el pico de memoria que agotaba el heap (OOM al parsear hojas grandes como
+// KOMMO ~13.7MB). Devuelve todas las filas (array de arrays), igual que values.get.
+async function getSheetValuesChunked(sheets, spreadsheetId, range, chunk = 4000) {
+  const bang = range.indexOf('!');
+  const sheetPart = bang >= 0 ? range.slice(0, bang) : range;
+  const colSpec = bang >= 0 ? range.slice(bang + 1) : 'A:ZZZ';
+  const parts = colSpec.split(':');
+  const startCol = (parts[0] || 'A').replace(/\d+/g, '') || 'A';
+  const endCol = (parts[1] || parts[0] || 'ZZZ').replace(/\d+/g, '') || 'ZZZ';
+  const q = "'" + sheetPart.replace(/'/g, "''") + "'";   // nombre de hoja citado (tiene espacios)
+  const all = [];
+  let lo = 1;
+  for (;;) {
+    const hi = lo + chunk - 1;
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: `${q}!${startCol}${lo}:${endCol}${hi}`,
+    });
+    const vals = resp.data.values || [];
+    for (const row of vals) all.push(row);
+    if (vals.length < chunk) break;   // último lote (Google recorta filas vacías finales)
+    lo += chunk;
+  }
+  return all;
+}
+
 // 📌 Ruta dinámica: /form/:sheetName
 app.get('/data/:sheetName', async (req, res) => {
   const { sheetName } = req.params;
@@ -147,13 +174,8 @@ app.get('/data/:sheetName', async (req, res) => {
       const client = await auth.getClient();
       const sheets = google.sheets({ version: 'v4', auth: client });
 
-      // Obtener datos de Google Sheets
-      const response = await sheets.spreadsheets.values.get({
-        spreadsheetId: config.spreadsheetId,
-        range: config.range,
-      });
-
-      const rows = response.data.values;
+      // Obtener datos de Google Sheets EN LOTES (evita el parse gigante → OOM).
+      const rows = await getSheetValuesChunked(sheets, config.spreadsheetId, config.range);
       if (!rows || rows.length === 0) {
         return res.status(404).send('No se encontraron datos en Google Sheets.');
       }
