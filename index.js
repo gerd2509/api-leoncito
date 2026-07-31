@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
 const cors = require('cors');
+const compression = require('compression');
 const { Pool } = require('pg');
 const multer = require('multer');
 const XLSX = require('xlsx');
@@ -10,6 +11,7 @@ const bcrypt = require('bcryptjs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
 app.use(cors());
 // Límite alto porque el control del supervisor puede traer fotos en base64.
 app.use(express.json({ limit: '20mb' }));
