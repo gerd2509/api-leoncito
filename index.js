@@ -183,42 +183,53 @@ app.get('/data/:sheetName', async (req, res) => {
     }
 
     const headers = cached.headers;
-    // Expandir a JSON en cada request (mutación directa: evita el spread O(cols²)).
-    let jsonData = cached.data.map((row) =>
-      headers.reduce((acc, header, i) => {
-        acc[header] = row[i] || '';
-        return acc;
-      }, {})
-    );
+    const data = cached.data;
 
-    // 🔎 Filtro opcional por fecha (evita traer todo el histórico: p.ej. /data/sedes?desde=2026-07-01&hasta=2026-07-31)
-    // Se filtra por la columna de fecha del sheet ("Marca temporal" o "Timestamp"),
-    // comparando en formato yyyy-mm-dd. Solo aplica si se envía desde/hasta.
+    // 🔎 Filtro opcional por fecha, resuelto por ÍNDICE de columna (sin expandir la
+    // hoja). p.ej. /data/sedes?desde=2026-07-01&hasta=2026-07-31
     const { desde, hasta } = req.query;
+    let colIdx = -1;
     if (desde || hasta) {
-      const colFecha = headers.includes('Marca temporal')
-        ? 'Marca temporal'
+      const colFecha = headers.includes('Marca temporal') ? 'Marca temporal'
         : (headers.includes('Timestamp') ? 'Timestamp' : null);
-      if (colFecha) {
-        const toKey = (marca) => {
-          if (!marca) return null;
-          const p = String(marca).trim().split(' ')[0].split('/'); // d/M/yyyy
-          if (p.length !== 3) return null;
-          const [d, mo, y] = p;
-          if (!y || !mo || !d) return null;
-          return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-        };
-        jsonData = jsonData.filter((row) => {
-          const k = toKey(row[colFecha]);
-          if (!k) return false;
-          if (desde && k < desde) return false;
-          if (hasta && k > hasta) return false;
-          return true;
-        });
-      }
+      colIdx = colFecha ? headers.indexOf(colFecha) : -1;
     }
+    const toKey = (marca) => {
+      if (!marca) return null;
+      const p = String(marca).trim().split(' ')[0].split('/'); // d/M/yyyy
+      if (p.length !== 3) return null;
+      const [d, mo, y] = p;
+      if (!y || !mo || !d) return null;
+      return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    };
+    const pasa = (row) => {
+      if (colIdx < 0) return true;
+      const k = toKey(row[colIdx]);
+      if (!k) return false;
+      if (desde && k < desde) return false;
+      if (hasta && k > hasta) return false;
+      return true;
+    };
 
-    res.json(jsonData);
+    // Respuesta en STREAMING por lotes: NO se materializa el array de 30k+ objetos
+    // ni el string gigante en memoria (eso agotaba el heap → FATAL "heap out of
+    // memory" / exit 134 en Render Free). compression() gzipa el stream al vuelo.
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.write('[');
+    const H = headers.length;
+    let first = true;
+    let buf = [];
+    for (let r = 0; r < data.length; r++) {
+      const row = data[r];
+      if (colIdx >= 0 && !pasa(row)) continue;
+      const obj = {};
+      for (let i = 0; i < H; i++) obj[headers[i]] = row[i] || '';
+      buf.push(JSON.stringify(obj));
+      if (buf.length >= 500) { res.write((first ? '' : ',') + buf.join(',')); first = false; buf = []; }
+    }
+    if (buf.length) res.write((first ? '' : ',') + buf.join(','));
+    res.write(']');
+    res.end();
   } catch (error) {
     console.error(`❌ Error al obtener datos de ${sheetName}:`, error);
     res.status(500).send('Error al obtener datos de Google Sheets');
