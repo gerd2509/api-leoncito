@@ -117,6 +117,15 @@ const sheetsConfigs = {
   }
 };
 
+// 🗃️ Cache en memoria de las hojas de Google Sheets. Evita descargar la hoja
+// entera (decenas de miles de filas) en CADA carga: la 1ª petición va a Google
+// y las siguientes, dentro del TTL, se sirven de memoria (instantáneas). Se
+// cachea el resultado YA transformado (headers + filas) por nombre de hoja; el
+// filtro por fecha se aplica después, en cada request. TTL por env (def. 3 min).
+// Forzar refresco con ?fresh=1.
+const SHEET_CACHE_TTL_MS = parseInt(process.env.SHEET_CACHE_TTL_MS || '180000', 10);
+const sheetCache = new Map(); // sheetName -> { ts, headers, jsonData }
+
 // 📌 Ruta dinámica: /form/:sheetName
 app.get('/data/:sheetName', async (req, res) => {
   const { sheetName } = req.params;
@@ -127,46 +136,56 @@ app.get('/data/:sheetName', async (req, res) => {
   }
 
   try {
-    // Autenticación dinámica
-    const auth = googleAuthConfigs[config.authKey];
-    const client = await auth.getClient();
-    const sheets = google.sheets({ version: 'v4', auth: client });
+    // Cache: si la hoja está en memoria y aún es fresca, se evita la descarga.
+    const ahora = Date.now();
+    let cached = sheetCache.get(sheetName);
+    if (!cached || req.query.fresh || (ahora - cached.ts) >= SHEET_CACHE_TTL_MS) {
+      // Autenticación dinámica
+      const auth = googleAuthConfigs[config.authKey];
+      const client = await auth.getClient();
+      const sheets = google.sheets({ version: 'v4', auth: client });
 
-    // Obtener datos
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: config.spreadsheetId,
-      range: config.range,
-    });
+      // Obtener datos de Google Sheets
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: config.spreadsheetId,
+        range: config.range,
+      });
 
-    const rows = response.data.values;
-    if (!rows || rows.length === 0) {
-      return res.status(404).send('No se encontraron datos en Google Sheets.');
+      const rows = response.data.values;
+      if (!rows || rows.length === 0) {
+        return res.status(404).send('No se encontraron datos en Google Sheets.');
+      }
+
+      const [rawHeaders, ...data] = rows;
+
+      // Evita encabezados duplicados
+      const headers = [];
+      const headerCount = {};
+      rawHeaders.forEach((header) => {
+        if (!headerCount[header]) {
+          headerCount[header] = 1;
+          headers.push(header);
+        } else {
+          const newHeader = `${header} (${headerCount[header]})`;
+          headerCount[header]++;
+          headers.push(newHeader);
+        }
+      });
+
+      // Transformar filas a JSON (mutación directa: evita el spread O(cols²)).
+      const jsonDataFull = data.map((row) =>
+        headers.reduce((acc, header, i) => {
+          acc[header] = row[i] || '';
+          return acc;
+        }, {})
+      );
+
+      cached = { ts: ahora, headers, jsonData: jsonDataFull };
+      sheetCache.set(sheetName, cached);
     }
 
-    const [rawHeaders, ...data] = rows;
-
-    // Evita encabezados duplicados
-    const headers = [];
-    const headerCount = {};
-
-    rawHeaders.forEach((header) => {
-      if (!headerCount[header]) {
-        headerCount[header] = 1;
-        headers.push(header);
-      } else {
-        const newHeader = `${header} (${headerCount[header]})`;
-        headerCount[header]++;
-        headers.push(newHeader);
-      }
-    });
-
-    // Transformar filas a JSON
-    let jsonData = data.map((row) =>
-      headers.reduce((acc, header, i) => ({
-        ...acc,
-        [header]: row[i] || '',
-      }), {})
-    );
+    const headers = cached.headers;
+    let jsonData = cached.jsonData;   // filtrar NO muta el cache (filter crea copia)
 
     // 🔎 Filtro opcional por fecha (evita traer todo el histórico: p.ej. /data/sedes?desde=2026-07-01&hasta=2026-07-31)
     // Se filtra por la columna de fecha del sheet ("Marca temporal" o "Timestamp"),
