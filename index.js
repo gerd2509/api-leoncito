@@ -840,6 +840,9 @@ app.post('/gestion-realzza/sync', async (req, res) => {
     let insertados = 0;
     try {
       await client.query('BEGIN');
+      // Re-migración idempotente: borra lo migrado antes ('form') y reinserta todo
+      // el sheet; conserva lo registrado desde la app ('app'). Así no se duplica.
+      await client.query("DELETE FROM gestion_realzza WHERE origen = 'form'");
       const CHUNK = 500;
       for (let i = 0; i < filas.length; i += CHUNK) {
         const chunk = filas.slice(i, i + CHUNK);
@@ -1144,6 +1147,9 @@ app.post('/gestion-call/sync', async (req, res) => {
     let insertados = 0;
     try {
       await client.query('BEGIN');
+      // Re-migración idempotente: borra lo migrado antes ('form') y reinserta todo
+      // el sheet; conserva lo registrado desde la app ('app'). Así no se duplica.
+      await client.query("DELETE FROM gestion_call WHERE origen = 'form'");
       const CHUNK = 500;
       for (let i = 0; i < filas.length; i += CHUNK) {
         const chunk = filas.slice(i, i + CHUNK);
