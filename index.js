@@ -906,6 +906,22 @@ app.post('/gestion-realzza', async (req, res) => {
   }
 });
 
+// Emite un array JSON en STREAMING por lotes (mapeando cada fila) sin materializar
+// todo el array ni el string gigante en memoria → evita OOM con decenas de miles
+// de filas. compression() lo gzipa al vuelo.
+function streamJsonRows(res, rows, mapFn) {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.write('[');
+  let first = true; let buf = [];
+  for (let i = 0; i < rows.length; i++) {
+    buf.push(JSON.stringify(mapFn(rows[i])));
+    if (buf.length >= 500) { res.write((first ? '' : ',') + buf.join(',')); first = false; buf = []; }
+  }
+  if (buf.length) res.write((first ? '' : ',') + buf.join(','));
+  res.write(']');
+  res.end();
+}
+
 // GET /gestion-realzza?desde=&hasta= — filas con las cabeceras de la hoja.
 app.get('/gestion-realzza', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -917,7 +933,7 @@ app.get('/gestion-realzza', async (req, res) => {
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
       `SELECT * FROM gestion_realzza ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
-    res.json(rows.map(grzRowToSheet));
+    streamJsonRows(res, rows, grzRowToSheet);
   } catch (e) {
     console.error('❌ GET /gestion-realzza:', e);
     res.status(500).json({ success: false, message: 'No se pudieron obtener las gestiones.' });
@@ -1210,7 +1226,7 @@ app.get('/gestion-call', async (req, res) => {
     if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(`SELECT * FROM gestion_call ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
-    res.json(rows.map(gcRowToSheet));
+    streamJsonRows(res, rows, gcRowToSheet);
   } catch (e) { console.error('❌ GET /gestion-call:', e); res.status(500).json({ success: false, message: 'No se pudieron obtener las gestiones.' }); }
 });
 
