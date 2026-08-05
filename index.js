@@ -982,6 +982,29 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
   }
 });
 
+// GET /gestion-sedes-deriv/live — respuestas del formulario EN VIVO (lee la hoja, NO la BD).
+// Lo usa ventas-service para cruzar la atribución de sedes directo del formulario, así no
+// depende de re-sincronizar la tabla espejo.
+app.get('/gestion-sedes-deriv/live', async (req, res) => {
+  try {
+    const data = await leerSedesDerivSheet();
+    const out = data
+      .filter(r => (r['DNI CLIENTE'] || '').toString().trim() !== '')
+      .map(r => ({
+        marca_temporal: parseMarcaTemporal(r['Marca temporal']),
+        sede: toStr(r['SEDE']),
+        dni_cliente: toStr(r['DNI CLIENTE']),
+        tipo_base: toStr(r['TIPO DE BASE']),
+        asesor: toStr(r['ASESOR LAMBAYEQUE']) || toStr(r['ASESOR FERREÑAFE']),
+        motivo_interes: toStr(r['MOTIVO INTERÉS']),
+      }));
+    res.json(out);
+  } catch (e) {
+    console.error('❌ GET /gestion-sedes-deriv/live:', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // POST /gestion-realzza — registra una gestión nueva desde la app (origen = 'app').
 app.post('/gestion-realzza', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
