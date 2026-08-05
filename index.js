@@ -104,6 +104,12 @@ const sheetsConfigs = {
     spreadsheetId: '1zHH-1n2fxknSOfPBje0U3x_hRXBXBh4M21KRGHGBbbQ',
     range: 'Respuestas de formulario 1!A:ZZZ',
   },
+  // Formulario de DERIVACIÓN por sede (Lambayeque / Ferreñafe) → cruce con ventas (atribución sedes).
+  sedesDeriv: {
+    authKey: 'claveUnica',
+    spreadsheetId: '1XHnjRCBncVUmth2a2kTrRTgrGuIghZJPYvNIXZlWtM4',
+    range: 'Respuestas de formulario 1!A:ZZZ',
+  },
   // CAP de asesores por sede (no es un formulario: es una hoja normal).
   // Se lee de la pestaña "CAP", cuya fila 1 son las cabeceras
   // (VENDEDOR, SEDE, SUPERVISOR, GERENTE DE TIENDA, ZONA, CANAL, ESTADO, DNI).
@@ -862,6 +868,116 @@ app.post('/gestion-realzza/sync', async (req, res) => {
     res.json({ success: true, leidas: data.length, insertados });
   } catch (e) {
     console.error('❌ POST /gestion-realzza/sync:', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🏬 GESTIÓN SEDES — DERIVACIÓN (Lambayeque / Ferreñafe) → tabla `gestion_sedes_deriv`
+// Formulario de Google independiente; se sincroniza a la BD para poder cruzarlo con
+// `ventas` en la atribución de sedes (mismo cruce por DNI que Call/Realzza).
+// ─────────────────────────────────────────────────────────────────────────────
+const SD_COLS = [
+  'marca_temporal', 'marca_temporal_raw', 'sede', 'asesor_lambayeque', 'asesor_ferrenafe',
+  'dni_cliente', 'celular_gestionado', 'tipo_base', 'tipo_cliente', 'estado_gestion',
+  'medio_primer_contacto', 'resultado_gestion', 'producto_interes', 'motivo_interes',
+  'fecha_interes_derivacion', 'hora_interes_derivacion', 'comentario_derivacion',
+];
+let sdSchemaLista = false;
+async function ensureGestionSedesDerivSchema() {
+  if (!pgPool || sdSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS gestion_sedes_deriv (
+      id                    BIGSERIAL PRIMARY KEY,
+      marca_temporal        TIMESTAMP,
+      marca_temporal_raw    TEXT,
+      sede                  TEXT,
+      asesor_lambayeque     TEXT,
+      asesor_ferrenafe      TEXT,
+      dni_cliente           TEXT,
+      celular_gestionado    TEXT,
+      tipo_base             TEXT,
+      tipo_cliente          TEXT,
+      estado_gestion        TEXT,
+      medio_primer_contacto TEXT,
+      resultado_gestion     TEXT,
+      producto_interes      TEXT,
+      motivo_interes        TEXT,
+      fecha_interes_derivacion TEXT,
+      hora_interes_derivacion  TEXT,
+      comentario_derivacion    TEXT,
+      creado_en             TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_gsd_dni   ON gestion_sedes_deriv (dni_cliente);
+    CREATE INDEX IF NOT EXISTS ix_gsd_marca ON gestion_sedes_deriv (marca_temporal);
+  `);
+  sdSchemaLista = true;
+}
+async function leerSedesDerivSheet() {
+  const config = sheetsConfigs['sedesDeriv'];
+  const auth = googleAuthConfigs[config.authKey];
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) return [];
+  const [headersRaw, ...data] = rows;
+  const seen = {}; const H = [];
+  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
+  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
+}
+function mapSedesDerivRow(r) {
+  return [
+    parseMarcaTemporal(r['Marca temporal']),
+    toStr(r['Marca temporal']),
+    toStr(r['SEDE']),
+    toStr(r['ASESOR LAMBAYEQUE']),
+    toStr(r['ASESOR FERREÑAFE']),
+    toStr(r['DNI CLIENTE']),
+    toStr(r['CELULAR GESTIONADO']),
+    toStr(r['TIPO DE BASE']),
+    toStr(r['TIPO DE CLIENTE']),
+    toStr(r['ESTADO DE GESTIÓN']),
+    toStr(r['MEDIO DE PRIMER CONTACTO']),
+    toStr(r['RESULTADO DE GESTIÓN']),
+    toStr(r['PRODUCTO INTERÉS']),
+    toStr(r['MOTIVO INTERÉS']),
+    toStr(r['FECHA DE INTERÉS DERIVACIÓN']),
+    toStr(r['HORA APROXIMADA INTERÉS DERIVACIÓN']),
+    toStr(r['COMENTARIO ADICIONAL DERIVACIÓN']),
+  ];
+}
+// POST /gestion-sedes-deriv/sync — reemplaza toda la tabla con lo que hay en el sheet.
+app.post('/gestion-sedes-deriv/sync', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionSedesDerivSchema();
+    const data = await leerSedesDerivSheet();
+    const filas = data.filter(r =>
+      (r['Marca temporal'] || '').toString().trim() !== '' || (r['DNI CLIENTE'] || '').toString().trim() !== '');
+    const client = await pgPool.connect();
+    let insertados = 0;
+    try {
+      await client.query('BEGIN');
+      await client.query('TRUNCATE gestion_sedes_deriv RESTART IDENTITY');
+      const CHUNK = 500;
+      for (let i = 0; i < filas.length; i += CHUNK) {
+        const chunk = filas.slice(i, i + CHUNK);
+        const params = [];
+        const tuples = chunk.map((r, idx) => {
+          const arr = mapSedesDerivRow(r);
+          const base = idx * SD_COLS.length;
+          params.push(...arr);
+          return '(' + SD_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+        });
+        await client.query(`INSERT INTO gestion_sedes_deriv (${SD_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
+        insertados += chunk.length;
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    res.json({ success: true, leidas: data.length, insertados });
+  } catch (e) {
+    console.error('❌ POST /gestion-sedes-deriv/sync:', e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
