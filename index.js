@@ -1084,6 +1084,33 @@ app.get('/cap', async (req, res) => {
   } catch (e) { console.error('❌ GET /cap:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /cap/meta — catálogos para el formulario del Maestro CAP:
+//   sedes:        [{ sede, gerente, zona }]  gerente/zona = el más frecuente de esa sede
+//   supervisores: [{ sede, nombre }]         distinct por sede (para el select filtrado)
+//   canales:      [ ... ]                     valores de canal existentes (como el sheet)
+app.get('/cap/meta', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    res.set('Cache-Control', 'no-store');
+    const sedes = await pgPool.query(`
+      SELECT sede,
+             mode() WITHIN GROUP (ORDER BY NULLIF(gerente,'')) AS gerente,
+             mode() WITHIN GROUP (ORDER BY NULLIF(zona,''))    AS zona
+      FROM cap_asesores WHERE COALESCE(sede,'') <> '' GROUP BY sede ORDER BY sede`);
+    const sup = await pgPool.query(`
+      SELECT DISTINCT sede, supervisor AS nombre FROM cap_asesores
+      WHERE COALESCE(supervisor,'') <> '' ORDER BY sede, nombre`);
+    const canales = await pgPool.query(`
+      SELECT DISTINCT canal FROM cap_asesores WHERE COALESCE(canal,'') <> '' ORDER BY canal`);
+    res.json({
+      sedes: sedes.rows,
+      supervisores: sup.rows,
+      canales: canales.rows.map(r => r.canal),
+    });
+  } catch (e) { console.error('❌ GET /cap/meta:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // POST /cap — alta de un asesor.
 app.post('/cap', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
