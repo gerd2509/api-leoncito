@@ -1010,6 +1010,46 @@ async function ensureCapSchema() {
   `);
   capSchemaLista = true;
 }
+// Tablas maestras: cap_sedes (gerente/zona por sede) y cap_supervisores (por sede).
+// Se auto-siembran desde cap_asesores la primera vez (migración transparente).
+let capMaestrosLista = false;
+async function ensureCapMaestros() {
+  if (!pgPool || capMaestrosLista) return;
+  await ensureCapSchema();
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS cap_sedes (
+      id BIGSERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL UNIQUE,
+      gerente TEXT, zona TEXT,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS cap_supervisores (
+      id BIGSERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      sede TEXT,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_capsup_sede ON cap_supervisores (sede);
+  `);
+  const sc = await pgPool.query('SELECT count(*)::int n FROM cap_sedes');
+  if (sc.rows[0].n === 0) {
+    await pgPool.query(`
+      INSERT INTO cap_sedes (nombre, gerente, zona)
+      SELECT sede, mode() WITHIN GROUP (ORDER BY NULLIF(gerente,'')),
+                   mode() WITHIN GROUP (ORDER BY NULLIF(zona,''))
+      FROM cap_asesores WHERE COALESCE(sede,'') <> '' GROUP BY sede
+      ON CONFLICT (nombre) DO NOTHING`);
+  }
+  const vc = await pgPool.query('SELECT count(*)::int n FROM cap_supervisores');
+  if (vc.rows[0].n === 0) {
+    await pgPool.query(`
+      INSERT INTO cap_supervisores (nombre, sede)
+      SELECT DISTINCT supervisor, sede FROM cap_asesores WHERE COALESCE(supervisor,'') <> ''`);
+  }
+  capMaestrosLista = true;
+}
 // Lee la hoja "CAP" (para la migración inicial).
 async function leerCapSheet() {
   const config = sheetsConfigs['capSedes'];
@@ -1070,16 +1110,23 @@ app.post('/cap/sync', async (req, res) => {
 app.get('/cap', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    await ensureCapSchema();
+    await ensureCapMaestros();
     res.set('Cache-Control', 'no-store');
     const cond = [], params = [];
-    if (req.query.sede)   { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
-    if (req.query.estado) { params.push(String(req.query.estado).toUpperCase()); cond.push(`upper(estado) = $${params.length}`); }
-    if (req.query.canal)  { params.push(`%${String(req.query.canal)}%`); cond.push(`canal ILIKE $${params.length}`); }
+    if (req.query.sede)   { params.push(`%${String(req.query.sede)}%`); cond.push(`a.sede ILIKE $${params.length}`); }
+    if (req.query.estado) { params.push(String(req.query.estado).toUpperCase()); cond.push(`upper(a.estado) = $${params.length}`); }
+    if (req.query.canal)  { params.push(`%${String(req.query.canal)}%`); cond.push(`a.canal ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    // gerente/zona vienen del maestro de sedes (autoritativo); si la sede no está en el
+    // maestro, se cae al valor propio del asesor.
     const { rows } = await pgPool.query(
-      `SELECT id, vendedor, sede, supervisor, gerente, zona, canal, estado, dni
-       FROM cap_asesores ${where} ORDER BY sede NULLS LAST, vendedor`, params);
+      `SELECT a.id, a.vendedor, a.sede, a.supervisor,
+              COALESCE(NULLIF(s.gerente,''), a.gerente) AS gerente,
+              COALESCE(NULLIF(s.zona,''),    a.zona)    AS zona,
+              a.canal, a.estado, a.dni
+       FROM cap_asesores a
+       LEFT JOIN cap_sedes s ON upper(trim(s.nombre)) = upper(trim(a.sede))
+       ${where} ORDER BY a.sede NULLS LAST, a.vendedor`, params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /cap:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -1091,16 +1138,10 @@ app.get('/cap', async (req, res) => {
 app.get('/cap/meta', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    await ensureCapSchema();
+    await ensureCapMaestros();
     res.set('Cache-Control', 'no-store');
-    const sedes = await pgPool.query(`
-      SELECT sede,
-             mode() WITHIN GROUP (ORDER BY NULLIF(gerente,'')) AS gerente,
-             mode() WITHIN GROUP (ORDER BY NULLIF(zona,''))    AS zona
-      FROM cap_asesores WHERE COALESCE(sede,'') <> '' GROUP BY sede ORDER BY sede`);
-    const sup = await pgPool.query(`
-      SELECT DISTINCT sede, supervisor AS nombre FROM cap_asesores
-      WHERE COALESCE(supervisor,'') <> '' ORDER BY sede, nombre`);
+    const sedes = await pgPool.query(`SELECT nombre AS sede, gerente, zona FROM cap_sedes ORDER BY nombre`);
+    const sup = await pgPool.query(`SELECT id, sede, nombre FROM cap_supervisores ORDER BY sede, nombre`);
     const canales = await pgPool.query(`
       SELECT DISTINCT canal FROM cap_asesores WHERE COALESCE(canal,'') <> '' ORDER BY canal`);
     res.json({
@@ -1109,6 +1150,108 @@ app.get('/cap/meta', async (req, res) => {
       canales: canales.rows.map(r => r.canal),
     });
   } catch (e) { console.error('❌ GET /cap/meta:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Maestro de SEDES (cap_sedes): gerente + zona por sede ──────────────────────
+app.get('/cap/sedes', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
+    const { rows } = await pgPool.query(`SELECT id, nombre, gerente, zona FROM cap_sedes ORDER BY nombre`);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cap/sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.post('/cap/sedes', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const b = req.body || {};
+    const nombre = String(b.nombre ?? '').trim();
+    if (!nombre) return res.status(400).json({ success: false, message: 'El nombre de la sede es obligatorio.' });
+    const { rows } = await pgPool.query(
+      `INSERT INTO cap_sedes (nombre, gerente, zona) VALUES ($1,$2,$3)
+       ON CONFLICT (nombre) DO UPDATE SET gerente=EXCLUDED.gerente, zona=EXCLUDED.zona, actualizado_en=now()
+       RETURNING id`,
+      [nombre, String(b.gerente ?? '').trim(), String(b.zona ?? '').trim().toUpperCase()]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /cap/sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.put('/cap/sedes/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const b = req.body || {};
+    const sets = [], vals = [];
+    const add = (c, v, up = false) => { let s = String(v ?? '').trim(); if (up) s = s.toUpperCase(); vals.push(s); sets.push(`${c} = $${vals.length}`); };
+    if (b.nombre  !== undefined) add('nombre', b.nombre);
+    if (b.gerente !== undefined) add('gerente', b.gerente);
+    if (b.zona    !== undefined) add('zona', b.zona, true);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    sets.push('actualizado_en = now()'); vals.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE cap_sedes SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Sede no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /cap/sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.delete('/cap/sedes/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const { rowCount } = await pgPool.query('DELETE FROM cap_sedes WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Sede no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /cap/sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Maestro de SUPERVISORES (cap_supervisores) por sede ────────────────────────
+app.get('/cap/supervisores', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
+    const cond = [], params = [];
+    if (req.query.sede) { params.push(String(req.query.sede)); cond.push(`upper(trim(sede)) = upper(trim($${params.length}))`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(`SELECT id, nombre, sede FROM cap_supervisores ${where} ORDER BY sede, nombre`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cap/supervisores:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.post('/cap/supervisores', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const b = req.body || {};
+    const nombre = String(b.nombre ?? '').trim();
+    if (!nombre) return res.status(400).json({ success: false, message: 'El nombre del supervisor es obligatorio.' });
+    const { rows } = await pgPool.query(
+      `INSERT INTO cap_supervisores (nombre, sede) VALUES ($1,$2) RETURNING id`,
+      [nombre, String(b.sede ?? '').trim()]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /cap/supervisores:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.put('/cap/supervisores/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const b = req.body || {};
+    const sets = [], vals = [];
+    const add = (c, v) => { vals.push(String(v ?? '').trim()); sets.push(`${c} = $${vals.length}`); };
+    if (b.nombre !== undefined) add('nombre', b.nombre);
+    if (b.sede   !== undefined) add('sede', b.sede);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    sets.push('actualizado_en = now()'); vals.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE cap_supervisores SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Supervisor no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.delete('/cap/supervisores/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const { rowCount } = await pgPool.query('DELETE FROM cap_supervisores WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Supervisor no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // POST /cap — alta de un asesor.
