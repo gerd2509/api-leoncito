@@ -1032,6 +1032,12 @@ async function ensureCapMaestros() {
       actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS ix_capsup_sede ON cap_supervisores (sede);
+    CREATE TABLE IF NOT EXISTS cap_gerentes (
+      id BIGSERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL UNIQUE,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
   const sc = await pgPool.query('SELECT count(*)::int n FROM cap_sedes');
   if (sc.rows[0].n === 0) {
@@ -1047,6 +1053,13 @@ async function ensureCapMaestros() {
     await pgPool.query(`
       INSERT INTO cap_supervisores (nombre, sede)
       SELECT DISTINCT supervisor, sede FROM cap_asesores WHERE COALESCE(supervisor,'') <> ''`);
+  }
+  const gc = await pgPool.query('SELECT count(*)::int n FROM cap_gerentes');
+  if (gc.rows[0].n === 0) {
+    await pgPool.query(`
+      INSERT INTO cap_gerentes (nombre)
+      SELECT DISTINCT gerente FROM cap_sedes WHERE COALESCE(gerente,'') <> ''
+      ON CONFLICT (nombre) DO NOTHING`);
   }
   capMaestrosLista = true;
 }
@@ -1252,6 +1265,50 @@ app.delete('/cap/supervisores/:id', async (req, res) => {
     if (!rowCount) return res.status(404).json({ success: false, message: 'Supervisor no encontrado.' });
     res.json({ success: true });
   } catch (e) { console.error('❌ DELETE /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Maestro de GERENTES (cap_gerentes) — se eligen al editar una sede ──────────
+app.get('/cap/gerentes', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
+    const { rows } = await pgPool.query(`SELECT id, nombre FROM cap_gerentes ORDER BY nombre`);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cap/gerentes:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.post('/cap/gerentes', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const nombre = String((req.body || {}).nombre ?? '').trim();
+    if (!nombre) return res.status(400).json({ success: false, message: 'El nombre del gerente es obligatorio.' });
+    const { rows } = await pgPool.query(
+      `INSERT INTO cap_gerentes (nombre) VALUES ($1) ON CONFLICT (nombre) DO UPDATE SET actualizado_en=now() RETURNING id`, [nombre]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /cap/gerentes:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.put('/cap/gerentes/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const nombre = String((req.body || {}).nombre ?? '').trim();
+    if (!nombre) return res.status(400).json({ success: false, message: 'El nombre del gerente es obligatorio.' });
+    // Renombra el gerente y propaga a las sedes que lo tenían.
+    const prev = await pgPool.query('SELECT nombre FROM cap_gerentes WHERE id=$1', [parseInt(req.params.id, 10)]);
+    if (!prev.rowCount) return res.status(404).json({ success: false, message: 'Gerente no encontrado.' });
+    await pgPool.query('UPDATE cap_gerentes SET nombre=$1, actualizado_en=now() WHERE id=$2', [nombre, parseInt(req.params.id, 10)]);
+    await pgPool.query('UPDATE cap_sedes SET gerente=$1, actualizado_en=now() WHERE gerente=$2', [nombre, prev.rows[0].nombre]);
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+app.delete('/cap/gerentes/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapMaestros();
+    const { rowCount } = await pgPool.query('DELETE FROM cap_gerentes WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Gerente no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // POST /cap — alta de un asesor.
