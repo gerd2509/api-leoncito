@@ -982,6 +982,162 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 👥 MAESTRO CAP (asesores por sede) — migrado de la hoja "CAP" a Postgres.
+// Tabla cap_asesores editable (alta/baja/edición) desde el módulo "Maestro CAP".
+// Fuente única del roster: CapSedesService ahora lee GET /cap (no la hoja).
+// ═════════════════════════════════════════════════════════════════════════════
+const CAP_COLS = ['vendedor', 'sede', 'supervisor', 'gerente', 'zona', 'canal', 'estado', 'dni'];
+let capSchemaLista = false;
+async function ensureCapSchema() {
+  if (!pgPool || capSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS cap_asesores (
+      id             BIGSERIAL PRIMARY KEY,
+      vendedor       TEXT NOT NULL,
+      sede           TEXT,
+      supervisor     TEXT,
+      gerente        TEXT,
+      zona           TEXT,
+      canal          TEXT,
+      estado         TEXT NOT NULL DEFAULT 'ACTIVO',
+      dni            TEXT,
+      creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_cap_sede   ON cap_asesores (sede);
+    CREATE INDEX IF NOT EXISTS ix_cap_estado ON cap_asesores (estado);
+  `);
+  capSchemaLista = true;
+}
+// Lee la hoja "CAP" (para la migración inicial).
+async function leerCapSheet() {
+  const config = sheetsConfigs['capSedes'];
+  const auth = googleAuthConfigs[config.authKey];
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) return [];
+  const [headersRaw, ...data] = rows;
+  const seen = {}; const H = [];
+  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
+  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
+}
+function mapCapRow(r) {
+  return [
+    toStr(r['VENDEDOR']), toStr(r['SEDE']), toStr(r['SUPERVISOR']),
+    toStr(r['GERENTE DE TIENDA']), toStr(r['ZONA']), toStr(r['CANAL']),
+    (toStr(r['ESTADO']) || 'ACTIVO'), toStr(r['DNI']),
+  ];
+}
+
+// POST /cap/sync — migración/refresco: reemplaza la tabla con lo que hay en la hoja CAP.
+app.post('/cap/sync', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    const data = await leerCapSheet();
+    const filas = data.filter(r => (r['VENDEDOR'] || '').toString().trim() !== '');
+    const client = await pgPool.connect();
+    let insertados = 0;
+    try {
+      await client.query('BEGIN');
+      await client.query('TRUNCATE cap_asesores RESTART IDENTITY');
+      const CHUNK = 500;
+      for (let i = 0; i < filas.length; i += CHUNK) {
+        const chunk = filas.slice(i, i + CHUNK);
+        const params = [];
+        const tuples = chunk.map((r, idx) => {
+          const arr = mapCapRow(r);
+          const base = idx * CAP_COLS.length;
+          params.push(...arr);
+          return '(' + CAP_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+        });
+        await client.query(`INSERT INTO cap_asesores (${CAP_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
+        insertados += chunk.length;
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    res.json({ success: true, leidas: data.length, insertados });
+  } catch (e) {
+    console.error('❌ POST /cap/sync:', e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// GET /cap?sede=&estado=&canal= — lista el CAP (fuente del CapSedesService).
+app.get('/cap', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    res.set('Cache-Control', 'no-store');
+    const cond = [], params = [];
+    if (req.query.sede)   { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+    if (req.query.estado) { params.push(String(req.query.estado).toUpperCase()); cond.push(`upper(estado) = $${params.length}`); }
+    if (req.query.canal)  { params.push(`%${String(req.query.canal)}%`); cond.push(`canal ILIKE $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(
+      `SELECT id, vendedor, sede, supervisor, gerente, zona, canal, estado, dni
+       FROM cap_asesores ${where} ORDER BY sede NULLS LAST, vendedor`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cap:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /cap — alta de un asesor.
+app.post('/cap', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    const b = req.body || {};
+    const vendedor = String(b.vendedor ?? '').trim();
+    if (!vendedor) return res.status(400).json({ success: false, message: 'El nombre del asesor (vendedor) es obligatorio.' });
+    const vals = [vendedor, String(b.sede ?? '').trim(), String(b.supervisor ?? '').trim(),
+      String(b.gerente ?? '').trim(), String(b.zona ?? '').trim().toUpperCase(),
+      String(b.canal ?? '').trim().toUpperCase(), (String(b.estado ?? '').trim().toUpperCase() || 'ACTIVO'),
+      String(b.dni ?? '').trim()];
+    const { rows } = await pgPool.query(
+      `INSERT INTO cap_asesores (${CAP_COLS.join(',')}) VALUES (${CAP_COLS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /cap:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /cap/:id — edición (solo los campos que llegan).
+app.put('/cap/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    const b = req.body || {};
+    const sets = [], vals = [];
+    const add = (col, val, upper = false) => { let s = String(val ?? '').trim(); if (upper) s = s.toUpperCase(); vals.push(s); sets.push(`${col} = $${vals.length}`); };
+    if (b.vendedor   !== undefined) add('vendedor', b.vendedor);
+    if (b.sede       !== undefined) add('sede', b.sede);
+    if (b.supervisor !== undefined) add('supervisor', b.supervisor);
+    if (b.gerente    !== undefined) add('gerente', b.gerente);
+    if (b.zona       !== undefined) add('zona', b.zona, true);
+    if (b.canal      !== undefined) add('canal', b.canal, true);
+    if (b.estado     !== undefined) add('estado', b.estado, true);
+    if (b.dni        !== undefined) add('dni', b.dni);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    sets.push('actualizado_en = now()');
+    vals.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE cap_asesores SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Asesor no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /cap/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// DELETE /cap/:id — baja definitiva (para "renuncia" usar estado=RENUNCIA con PUT).
+app.delete('/cap/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCapSchema();
+    const { rowCount } = await pgPool.query('DELETE FROM cap_asesores WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Asesor no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /cap/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /gestion-sedes-deriv/live — respuestas del formulario EN VIVO (lee la hoja, NO la BD).
 // Lo usa ventas-service para cruzar la atribución de sedes directo del formulario, así no
 // depende de re-sincronizar la tabla espejo.
