@@ -290,11 +290,31 @@ app.post('/auth/login', async (req, res) => {
       sedes: Array.isArray(u.sedes) && u.sedes.length ? u.sedes : (u.sede ? [u.sede] : []),
       vendedor: u.vendedor || '', canal: u.canal || '',
       modulos: Array.isArray(u.modulos) ? u.modulos : null,   // null = usa default por rol-perfil
+      debeCambiarPassword: !!u.debe_cambiar_password,          // forzar cambio en el 1er login
     });
   } catch (error) {
     console.error('❌ Error en /auth/login:', error);
     res.status(500).json({ success: false, message: 'Error al autenticar.' });
   }
+});
+
+// POST /auth/cambiar-password — el propio usuario cambia su clave (valida la actual).
+// Usado en el "forzar cambio en el primer login" y para autoservicio.
+app.post('/auth/cambiar-password', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const { usuario, actual, nueva } = req.body || {};
+  if (!usuario || !actual || !nueva) return res.status(400).json({ success: false, message: 'Faltan datos.' });
+  if (String(nueva).length < 4) return res.status(400).json({ success: false, message: 'La nueva contraseña es muy corta (mínimo 4).' });
+  try {
+    await ensureUsuariosSchema();
+    const { rows } = await pgPool.query('SELECT * FROM usuarios WHERE lower(usuario) = lower($1)', [usuario]);
+    const u = rows[0];
+    const ok = u && u.activo && await bcrypt.compare(String(actual), u.password_hash || '');
+    if (!ok) return res.status(401).json({ success: false, message: 'La contraseña actual no es correcta.' });
+    const hash = await bcrypt.hash(String(nueva), 10);
+    await pgPool.query('UPDATE usuarios SET password_hash = $1, debe_cambiar_password = false, actualizado_en = now() WHERE id = $2', [hash, u.id]);
+    res.json({ success: true });
+  } catch (e) { console.error('❌ /auth/cambiar-password:', e); res.status(500).json({ success: false, message: 'No se pudo cambiar la contraseña.' }); }
 });
 
 // GET /auth/marca?usuario=... — sede del usuario (sin contraseña) para personalizar el branding del login.
@@ -460,6 +480,9 @@ async function ensureUsuariosSchema() {
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sedes    JSONB;
     -- Permisos POR USUARIO: lista de módulos (JSONB). NULL = usa el default por rol-perfil.
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS modulos  JSONB;
+    -- Vínculo con el CAP: DNI del asesor (usuario/clave por defecto) + forzar cambio 1er login.
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dni      TEXT;
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS debe_cambiar_password BOOLEAN NOT NULL DEFAULT false;
   `);
   usuariosSchemaLista = true;
 }
@@ -507,7 +530,7 @@ app.get('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const { rows } = await pgPool.query(
-      'SELECT id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+      'SELECT id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni, debe_cambiar_password, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
     );
     res.json(rows);
   } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
@@ -528,13 +551,14 @@ app.post('/usuarios', async (req, res) => {
     const sedesJson = sedesArr.length ? JSON.stringify(sedesArr) : null;
     const sedePrincipal = ((b.sede || '').toString().trim()) || sedesArr[0] || '';
     const { rows } = await pgPool.query(
-      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10)
-       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo`,
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo, dni, debe_cambiar_password)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12)
+       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni`,
       [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
        sedePrincipal,
        (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
-       modulos, sedesJson, b.activo !== false]
+       modulos, sedesJson, b.activo !== false,
+       (b.dni || '').toString().trim() || null, !!b.debe_cambiar_password]
     );
     res.json({ success: true, usuario: rows[0] });
   } catch (e) {
@@ -561,6 +585,8 @@ app.put('/usuarios/:id', async (req, res) => {
                     sedePrincipal, b.activo !== false,
                     (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
                     sedesJson];
+    if (b.dni !== undefined) { params.push((b.dni || '').toString().trim() || null); campos.push(`dni = $${params.length}`); }
+    if (b.debe_cambiar_password !== undefined) { params.push(!!b.debe_cambiar_password); campos.push(`debe_cambiar_password = $${params.length}`); }
     if (b.password && b.password.toString().trim() !== '') {
       const hash = await bcrypt.hash(b.password.toString(), 10);
       params.push(hash);
