@@ -938,6 +938,9 @@ async function ensureGestionSedesDerivSchema() {
     CREATE INDEX IF NOT EXISTS ix_gsd_marca ON gestion_sedes_deriv (marca_temporal);
     -- origen: 'sheet' (importado del formulario, se re-sincroniza) | 'app' (registrado por plataforma, se conserva).
     ALTER TABLE gestion_sedes_deriv ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'sheet';
+    -- hash de la fila del formulario → el sync solo AGREGA lo nuevo (no borra ni duplica).
+    ALTER TABLE gestion_sedes_deriv ADD COLUMN IF NOT EXISTS hash_row TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_gsd_hash ON gestion_sedes_deriv (hash_row) WHERE hash_row IS NOT NULL;
   `);
   sdSchemaLista = true;
 }
@@ -983,27 +986,35 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
     const data = await leerSedesDerivSheet();
     const filas = data.filter(r =>
       (r['Marca temporal'] || '').toString().trim() !== '' || (r['DNI CLIENTE'] || '').toString().trim() !== '');
+    const crypto = require('crypto');
+    const hashDeriv = (r) => crypto.createHash('sha1').update([
+      toStr(r['Marca temporal']), toStr(r['DNI CLIENTE']),
+      toStr(r['ASESOR LAMBAYEQUE']) || toStr(r['ASESOR FERREÑAFE']),
+      toStr(r['MOTIVO INTERÉS']), toStr(r['CELULAR GESTIONADO']),
+    ].join('|')).digest('hex');
+    const cols = [...SD_COLS, 'hash_row'];
     const client = await pgPool.connect();
     let insertados = 0;
     try {
-      await client.query('BEGIN');
-      // Solo se reemplazan las filas del formulario; las registradas por plataforma (origen 'app') se conservan.
-      await client.query(`DELETE FROM gestion_sedes_deriv WHERE origen = 'sheet'`);
+      // Limpieza puntual de filas 'sheet' legado sin hash (para pasar al modo aditivo).
+      // Las registradas por plataforma (origen 'app') NUNCA se tocan.
+      await client.query(`DELETE FROM gestion_sedes_deriv WHERE origen = 'sheet' AND hash_row IS NULL`);
       const CHUNK = 500;
       for (let i = 0; i < filas.length; i += CHUNK) {
         const chunk = filas.slice(i, i + CHUNK);
         const params = [];
         const tuples = chunk.map((r, idx) => {
-          const arr = mapSedesDerivRow(r);
-          const base = idx * SD_COLS.length;
+          const arr = [...mapSedesDerivRow(r), hashDeriv(r)];
+          const base = idx * cols.length;
           params.push(...arr);
-          return '(' + SD_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+          return '(' + cols.map((_, j) => `$${base + j + 1}`).join(',') + ')';
         });
-        await client.query(`INSERT INTO gestion_sedes_deriv (${SD_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
-        insertados += chunk.length;
+        const rr = await client.query(
+          `INSERT INTO gestion_sedes_deriv (${cols.join(',')}) VALUES ${tuples.join(',')}
+           ON CONFLICT (hash_row) WHERE hash_row IS NOT NULL DO NOTHING`, params);
+        insertados += rr.rowCount;
       }
-      await client.query('COMMIT');
-    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    } finally { client.release(); }
     res.json({ success: true, leidas: data.length, insertados });
   } catch (e) {
     console.error('❌ POST /gestion-sedes-deriv/sync:', e);
