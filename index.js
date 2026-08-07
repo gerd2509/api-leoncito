@@ -1011,6 +1011,32 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
   }
 });
 
+// GET /gestion-sedes-deriv?asesor=&sede=&desde=&hasta= — lista derivaciones (para Mi Panel).
+app.get('/gestion-sedes-deriv', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionSedesDerivSchema();
+    res.set('Cache-Control', 'no-store');
+    const FECHA = `COALESCE(marca_temporal, creado_en AT TIME ZONE 'America/Lima')`;
+    const cond = [], params = [];
+    if (req.query.asesor) {
+      params.push(String(req.query.asesor).trim());
+      cond.push(`(upper(trim(asesor_ferrenafe)) = upper(trim($${params.length})) OR upper(trim(asesor_lambayeque)) = upper(trim($${params.length})))`);
+    }
+    if (req.query.sede)  { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+    if (req.query.desde) { params.push(String(req.query.desde)); cond.push(`${FECHA}::date >= $${params.length}`); }
+    if (req.query.hasta) { params.push(String(req.query.hasta)); cond.push(`${FECHA}::date <= $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(
+      `SELECT id, to_char(${FECHA}, 'DD/MM/YYYY HH24:MI:SS') AS marca, sede,
+              COALESCE(NULLIF(asesor_ferrenafe,''), asesor_lambayeque) AS asesor,
+              dni_cliente, celular_gestionado, tipo_base, tipo_cliente, producto_interes, motivo_interes,
+              fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion, origen
+       FROM gestion_sedes_deriv ${where} ORDER BY ${FECHA} DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // POST /gestion-sedes-deriv — registro de una derivación de venta desde la plataforma
 // (origen 'app', se conserva al re-sincronizar). El asesor va a la columna de su sede.
 app.post('/gestion-sedes-deriv', async (req, res) => {
