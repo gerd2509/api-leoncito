@@ -936,6 +936,8 @@ async function ensureGestionSedesDerivSchema() {
     );
     CREATE INDEX IF NOT EXISTS ix_gsd_dni   ON gestion_sedes_deriv (dni_cliente);
     CREATE INDEX IF NOT EXISTS ix_gsd_marca ON gestion_sedes_deriv (marca_temporal);
+    -- origen: 'sheet' (importado del formulario, se re-sincroniza) | 'app' (registrado por plataforma, se conserva).
+    ALTER TABLE gestion_sedes_deriv ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'sheet';
   `);
   sdSchemaLista = true;
 }
@@ -985,7 +987,8 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
     let insertados = 0;
     try {
       await client.query('BEGIN');
-      await client.query('TRUNCATE gestion_sedes_deriv RESTART IDENTITY');
+      // Solo se reemplazan las filas del formulario; las registradas por plataforma (origen 'app') se conservan.
+      await client.query(`DELETE FROM gestion_sedes_deriv WHERE origen = 'sheet'`);
       const CHUNK = 500;
       for (let i = 0; i < filas.length; i += CHUNK) {
         const chunk = filas.slice(i, i + CHUNK);
@@ -1006,6 +1009,36 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
     console.error('❌ POST /gestion-sedes-deriv/sync:', e);
     res.status(500).json({ success: false, message: e.message });
   }
+});
+
+// POST /gestion-sedes-deriv — registro de una derivación de venta desde la plataforma
+// (origen 'app', se conserva al re-sincronizar). El asesor va a la columna de su sede.
+app.post('/gestion-sedes-deriv', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  const sede = toStr(b.sede);
+  const asesor = toStr(b.asesor);
+  if (!sede || !asesor || !toStr(b.dni_cliente)) {
+    return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (sede, asesor, dni_cliente).' });
+  }
+  try {
+    await ensureGestionSedesDerivSchema();
+    const esFerre = sede.toUpperCase().includes('FERRE');
+    const vals = [
+      new Date(), ahoraLima(), sede,
+      esFerre ? '' : asesor,   // asesor_lambayeque
+      esFerre ? asesor : '',   // asesor_ferrenafe
+      toStr(b.dni_cliente), toStr(b.celular_gestionado), toStr(b.tipo_base), toStr(b.tipo_cliente),
+      toStr(b.estado_gestion), toStr(b.medio_primer_contacto), toStr(b.resultado_gestion),
+      toStr(b.producto_interes), (toStr(b.motivo_interes) || 'VENTA DERIVADA PARA CIERRE A SEDE'),
+      toStr(b.fecha_interes_derivacion), toStr(b.hora_interes_derivacion), toStr(b.comentario_derivacion),
+      'app',
+    ];
+    const cols = [...SD_COLS, 'origen'];
+    const { rows } = await pgPool.query(
+      `INSERT INTO gestion_sedes_deriv (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
