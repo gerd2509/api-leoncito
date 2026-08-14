@@ -685,6 +685,25 @@ app.patch('/usuarios/:id/estado', async (req, res) => {
   } catch (e) { console.error('❌ PATCH /usuarios/:id/estado', e); res.status(500).json({ success: false, message: 'No se pudo cambiar el estado.' }); }
 });
 
+// DELETE /usuarios/:id — borra el usuario de la BD (real, no solo desactivar).
+// Guardia: no permite borrar el ÚLTIMO admin activo (evita quedarse sin acceso).
+app.delete('/usuarios/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ success: false, message: 'Id inválido.' });
+  try {
+    await ensureUsuariosSchema();
+    const { rows: objetivo } = await pgPool.query('SELECT id, usuario, rol FROM usuarios WHERE id = $1', [id]);
+    if (!objetivo.length) return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
+    if ((objetivo[0].rol || '').toLowerCase() === 'admin') {
+      const { rows: adm } = await pgPool.query(`SELECT COUNT(*)::int n FROM usuarios WHERE LOWER(rol) = 'admin' AND activo = true`);
+      if (adm[0].n <= 1) return res.status(409).json({ success: false, message: 'No se puede eliminar el único administrador.' });
+    }
+    await pgPool.query('DELETE FROM usuarios WHERE id = $1', [id]);
+    res.json({ success: true, id, usuario: objetivo[0].usuario });
+  } catch (e) { console.error('❌ DELETE /usuarios/:id', e); res.status(500).json({ success: false, message: 'No se pudo eliminar el usuario.' }); }
+});
+
 // PATCH /usuarios/:id/modulos — permisos POR USUARIO (lista de módulos). null = usa default rol-perfil.
 app.patch('/usuarios/:id/modulos', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
