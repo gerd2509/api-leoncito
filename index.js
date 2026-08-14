@@ -567,6 +567,69 @@ app.post('/usuarios', async (req, res) => {
   }
 });
 
+// 👥 ALTA MASIVA de usuarios de una SEDE desde el CAP (cap_asesores ACTIVO con DNI).
+// Crea un usuario "vendedor de sede" por cada asesor: usuario=DNI, contraseña=DNI, canal=sede,
+// forzar cambio en el 1er login. Omite los que ya existen (por usuario o DNI).
+//   GET  /usuarios/bulk-cap?sede=lambayeque → previsualiza (quiénes se crearían / ya existen)
+//   POST /usuarios/bulk-cap { sede }        → crea los que faltan y devuelve el resumen.
+function normSedeKey(s) {
+  return (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/ñ/g, 'n').replace(/[^a-z0-9]/g, '').replace(/^sederelenor/, '');
+}
+// Asesores ACTIVOS con DNI de la sede (normalizada) + si ya tienen usuario creado.
+async function capAsesoresDeSede(sedeKey) {
+  const { rows } = await pgPool.query(`
+    SELECT c.vendedor, TRIM(c.dni) AS dni,
+      EXISTS(SELECT 1 FROM usuarios u WHERE u.usuario = TRIM(c.dni) OR u.dni = TRIM(c.dni)
+             OR UPPER(TRIM(u.vendedor)) = UPPER(TRIM(c.vendedor))) AS existe
+    FROM cap_asesores c
+    WHERE c.estado = 'ACTIVO' AND c.dni IS NOT NULL AND TRIM(c.dni) <> ''
+      AND regexp_replace(lower(translate(c.sede,'ñÑ','nn')),'[^a-z0-9]','','g') = $1
+    ORDER BY c.vendedor`, [sedeKey]);
+  return rows;
+}
+app.get('/usuarios/bulk-cap', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureUsuariosSchema(); await ensureCapSchema();
+    const sedeKey = normSedeKey(req.query.sede);
+    if (!sedeKey) return res.status(400).json({ success: false, message: 'Falta la sede.' });
+    const filas = await capAsesoresDeSede(sedeKey);
+    res.json({
+      success: true, sede: sedeKey, total: filas.length,
+      nuevos: filas.filter(f => !f.existe).length,
+      existentes: filas.filter(f => f.existe).length,
+      detalle: filas,
+    });
+  } catch (e) { console.error('❌ GET /usuarios/bulk-cap', e); res.status(500).json({ success: false, message: 'No se pudo leer el CAP.' }); }
+});
+app.post('/usuarios/bulk-cap', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureUsuariosSchema(); await ensureCapSchema();
+    const sedeKey = normSedeKey((req.body || {}).sede);
+    if (!sedeKey) return res.status(400).json({ success: false, message: 'Falta la sede.' });
+    const filas = await capAsesoresDeSede(sedeKey);
+    const creados = [], omitidos = [];
+    for (const f of filas) {
+      if (f.existe) { omitidos.push({ vendedor: f.vendedor, dni: f.dni, motivo: 'ya existe' }); continue; }
+      const dni = (f.dni || '').toString().trim();
+      try {
+        const hash = await bcrypt.hash(dni, 10);
+        const { rowCount } = await pgPool.query(
+          `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo, dni, debe_cambiar_password)
+           VALUES ($1,$2,$3,'vendedor',$4,$5,'sede',NULL,$6::jsonb,true,$7,true)
+           ON CONFLICT (usuario) DO NOTHING`,
+          [dni, hash, f.vendedor, sedeKey, f.vendedor, JSON.stringify([sedeKey]), dni]
+        );
+        if (rowCount > 0) creados.push({ vendedor: f.vendedor, dni, usuario: dni });
+        else omitidos.push({ vendedor: f.vendedor, dni, motivo: 'ya existe' });
+      } catch (e) { omitidos.push({ vendedor: f.vendedor, dni, motivo: 'error' }); }
+    }
+    res.json({ success: true, sede: sedeKey, creados: creados.length, omitidos: omitidos.length, detalle: { creados, omitidos } });
+  } catch (e) { console.error('❌ POST /usuarios/bulk-cap', e); res.status(500).json({ success: false, message: 'No se pudo crear los usuarios.' }); }
+});
+
 // PUT /usuarios/:id — edita; si mandan password (no vacío) se rehashea.
 app.put('/usuarios/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
