@@ -101,7 +101,7 @@ const sheetsConfigs = {
   },
   sedes: {
     authKey: 'claveUnica',
-    spreadsheetId: '1zHH-1n2fxknSOfPBje0U3x_hRXBXBh4M21KRGHGBbbQ',
+    spreadsheetId: '1bEfZoN_NqqWOKJ3vQrEAmaaaSRl3TsCJ2hDs51ni7Nw',
     range: 'Respuestas de formulario 1!A:ZZZ',
   },
   // Formulario de DERIVACIÓN por sede (Lambayeque / Ferreñafe) → cruce con ventas (atribución sedes).
