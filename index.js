@@ -288,7 +288,7 @@ app.post('/auth/login', async (req, res) => {
       success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
       // Sedes asignadas (varias). Si no hay lista, cae a [sede] para compatibilidad.
       sedes: Array.isArray(u.sedes) && u.sedes.length ? u.sedes : (u.sede ? [u.sede] : []),
-      vendedor: u.vendedor || '', canal: u.canal || '',
+      vendedor: u.vendedor || '', canal: u.canal || '', vehiculo: u.vehiculo || '',
       modulos: Array.isArray(u.modulos) ? u.modulos : null,   // null = usa default por rol-perfil
       debeCambiarPassword: !!u.debe_cambiar_password,          // forzar cambio en el 1er login
     });
@@ -483,6 +483,8 @@ async function ensureUsuariosSchema() {
     -- Vínculo con el CAP: DNI del asesor (usuario/clave por defecto) + forzar cambio 1er login.
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dni      TEXT;
     ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS debe_cambiar_password BOOLEAN NOT NULL DEFAULT false;
+    -- Carro de reparto asignado (rol chofer): AZUL / VERDE / NARANJA.
+    ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS vehiculo TEXT;
   `);
   usuariosSchemaLista = true;
 }
@@ -530,7 +532,7 @@ app.get('/usuarios', async (req, res) => {
   try {
     await ensureUsuariosSchema();
     const { rows } = await pgPool.query(
-      'SELECT id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni, debe_cambiar_password, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
+      'SELECT id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni, debe_cambiar_password, vehiculo, creado_en, actualizado_en FROM usuarios ORDER BY usuario'
     );
     res.json(rows);
   } catch (e) { console.error('❌ GET /usuarios', e); res.status(500).json({ success: false, message: 'No se pudieron obtener los usuarios.' }); }
@@ -551,14 +553,15 @@ app.post('/usuarios', async (req, res) => {
     const sedesJson = sedesArr.length ? JSON.stringify(sedesArr) : null;
     const sedePrincipal = ((b.sede || '').toString().trim()) || sedesArr[0] || '';
     const { rows } = await pgPool.query(
-      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo, dni, debe_cambiar_password)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12)
-       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni`,
+      `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo, dni, debe_cambiar_password, vehiculo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13)
+       RETURNING id, usuario, nombre, rol, sede, sedes, vendedor, canal, modulos, activo, dni, vehiculo`,
       [usuario, hash, (b.nombre || '').toString().trim(), (b.rol || '').toString().trim(),
        sedePrincipal,
        (b.vendedor || '').toString().trim() || null, (b.canal || '').toString().trim() || null,
        modulos, sedesJson, b.activo !== false,
-       (b.dni || '').toString().trim() || null, !!b.debe_cambiar_password]
+       (b.dni || '').toString().trim() || null, !!b.debe_cambiar_password,
+       (b.vehiculo || '').toString().trim().toUpperCase() || null]
     );
     res.json({ success: true, usuario: rows[0] });
   } catch (e) {
@@ -653,6 +656,7 @@ app.put('/usuarios/:id', async (req, res) => {
                     sedesJson];
     if (b.dni !== undefined) { params.push((b.dni || '').toString().trim() || null); campos.push(`dni = $${params.length}`); }
     if (b.debe_cambiar_password !== undefined) { params.push(!!b.debe_cambiar_password); campos.push(`debe_cambiar_password = $${params.length}`); }
+    if (b.vehiculo !== undefined) { params.push((b.vehiculo || '').toString().trim().toUpperCase() || null); campos.push(`vehiculo = $${params.length}`); }
     if (b.password && b.password.toString().trim() !== '') {
       const hash = await bcrypt.hash(b.password.toString(), 10);
       params.push(hash);
