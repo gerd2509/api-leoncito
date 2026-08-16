@@ -1150,8 +1150,9 @@ app.post('/gestion-sedes-deriv', async (req, res) => {
   try {
     await ensureGestionSedesDerivSchema();
     const esFerre = sede.toUpperCase().includes('FERRE');
+    const t = ahoraLima();   // hora Lima (marca_temporal = t.ts, NO `new Date()` UTC → evitaba el +5h)
     const vals = [
-      new Date(), ahoraLima(), sede,
+      t.ts, t.raw, sede,
       esFerre ? '' : asesor,   // asesor_lambayeque
       esFerre ? asesor : '',   // asesor_ferrenafe
       toStr(b.dni_cliente), toStr(b.celular_gestionado), toStr(b.tipo_base), toStr(b.tipo_cliente),
@@ -1165,6 +1166,49 @@ app.post('/gestion-sedes-deriv', async (req, res) => {
       `INSERT INTO gestion_sedes_deriv (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
     res.json({ success: true, id: rows[0].id });
   } catch (e) { console.error('❌ POST /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /gestion-sedes-deriv/:id — editar una derivación (persiste en BD). El asesor va a la
+// columna de su sede (Ferreñafe → asesor_ferrenafe, resto → asesor_lambayeque).
+app.put('/gestion-sedes-deriv/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const id = String(req.params.id || '').trim();
+  const b = req.body || {};
+  if (!id) return res.status(400).json({ success: false, message: 'Falta id.' });
+  try {
+    await ensureGestionSedesDerivSchema();
+    const sede = toStr(b.sede);
+    const asesor = toStr(b.asesor);
+    const esFerre = sede.toUpperCase().includes('FERRE');
+    // Solo se editan las columnas visibles del módulo; estado_gestion / medio_primer_contacto /
+    // resultado_gestion se conservan intactos (no se sobreescriben para no borrarlos).
+    const { rowCount } = await pgPool.query(
+      `UPDATE gestion_sedes_deriv SET
+         sede = $2, asesor_lambayeque = $3, asesor_ferrenafe = $4,
+         dni_cliente = $5, celular_gestionado = $6, tipo_base = $7, tipo_cliente = $8,
+         producto_interes = $9, motivo_interes = $10,
+         fecha_interes_derivacion = $11, hora_interes_derivacion = $12, comentario_derivacion = $13
+       WHERE id = $1`,
+      [id, sede, esFerre ? '' : asesor, esFerre ? asesor : '',
+       toStr(b.dni_cliente), toStr(b.celular_gestionado), toStr(b.tipo_base), toStr(b.tipo_cliente),
+       toStr(b.producto_interes), toStr(b.motivo_interes),
+       toStr(b.fecha_interes_derivacion), toStr(b.hora_interes_derivacion), toStr(b.comentario_derivacion)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'No existe la derivación.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// DELETE /gestion-sedes-deriv/:id — elimina una derivación de la BD.
+app.delete('/gestion-sedes-deriv/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ success: false, message: 'Falta id.' });
+  try {
+    await ensureGestionSedesDerivSchema();
+    const { rowCount } = await pgPool.query(`DELETE FROM gestion_sedes_deriv WHERE id = $1`, [id]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'No existe la derivación.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
