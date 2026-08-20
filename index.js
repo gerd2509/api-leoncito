@@ -39,16 +39,9 @@ const googleAuthConfigs = {
 
 // 🔹 Configuración de hojas (puedes agregar más fácilmente)
 const sheetsConfigs = {
-  call: {
-    authKey: 'claveUnica',
-    spreadsheetId: '1j3b7k-vD9UzWLqz6JJksm5Vj3dWvtqL4SckMP21II94',
-    range: 'Respuestas de formulario 1!A:ZZZ',
-  },
-  campo: {
-    authKey: 'claveUnica',
-    spreadsheetId: '10rjPaki_8JIxJAyN96QK1Wr2MPeu0MfgVm6G8yezP-s',
-    range: 'Form Responses 1!A:ZZZ',
-  },
+  // NOTA: los formularios de gestión Call (call), Realzza (campo) y KOMMO (kommo) se
+  // migraron a PostgreSQL (tablas gestion_call/gestion_realzza/gestion_kommo). Ya no se
+  // leen ni se sincronizan desde Google Sheets, por eso se quitaron sus configuraciones.
   postVenta: {
     authKey: 'claveUnica',
     spreadsheetId: '1uJGGD-eLH8But-5rGdPcmgHZQl1tRbdsG5aDrHj-5UU',
@@ -88,11 +81,6 @@ const sheetsConfigs = {
     authKey: 'claveUnica',
     spreadsheetId: '17ZG1N52lg7O7i8a-7D6xbkszaUG-bSQXSUjK3OP-QDs',
     range: 'Respuestas!A:ZZZ',
-  },
-  kommo: {
-    authKey: 'claveUnica',
-    spreadsheetId: '18Dcde-XEdMUEMZ3Fekz3gkXpPP7UzPZxpnoMzcZlm-w',
-    range: 'Respuestas de formulario 1!A:ZZZ',
   },
   ferre: {
     authKey: 'claveUnica',
@@ -929,63 +917,8 @@ function grzRowToSheet(row) {
   };
 }
 
-// Lee la hoja de respuestas del form Realzza (campo) como objetos por cabecera.
-async function leerCampoSheet() {
-  const config = sheetsConfigs['campo'];
-  const auth = googleAuthConfigs[config.authKey];
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
-  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
-  const rows = resp.data.values || [];
-  if (rows.length < 2) return [];
-  const [headersRaw, ...data] = rows;
-  const seen = {}; const H = [];
-  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
-  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
-}
-
-// POST /gestion-realzza/sync — migra una sola vez las respuestas del form a la BD.
-app.post('/gestion-realzza/sync', async (req, res) => {
-  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
-  try {
-    await ensureGestionRealzzaSchema();
-    const { rows: cnt } = await pgPool.query("SELECT COUNT(*)::int AS n FROM gestion_realzza WHERE origen = 'form'");
-    if (cnt[0].n > 0 && req.query.force !== '1') {
-      return res.json({ success: true, yaMigrado: true, existentes: cnt[0].n });
-    }
-    const data = await leerCampoSheet();
-    const filas = data.filter(r =>
-      (r['Marca temporal'] || '').toString().trim() !== '' || (r['ASESOR REALZZA'] || '').toString().trim() !== '');
-
-    const client = await pgPool.connect();
-    let insertados = 0;
-    try {
-      await client.query('BEGIN');
-      // Re-migración idempotente: borra lo migrado antes ('form') y reinserta todo
-      // el sheet; conserva lo registrado desde la app ('app'). Así no se duplica.
-      await client.query("DELETE FROM gestion_realzza WHERE origen = 'form'");
-      const CHUNK = 500;
-      for (let i = 0; i < filas.length; i += CHUNK) {
-        const chunk = filas.slice(i, i + CHUNK);
-        const params = [];
-        const tuples = chunk.map((r, idx) => {
-          const arr = mapRealzzaRow(r, 'form');
-          const base = idx * GRZ_COLS.length;
-          params.push(...arr);
-          return '(' + GRZ_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
-        });
-        await client.query(`INSERT INTO gestion_realzza (${GRZ_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
-        insertados += chunk.length;
-      }
-      await client.query('COMMIT');
-    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-
-    res.json({ success: true, leidas: data.length, insertados });
-  } catch (e) {
-    console.error('❌ POST /gestion-realzza/sync:', e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
+// (Removido) La gestión Realzza ya NO se migra desde Google Sheets: se registra
+// directo en la BD (tabla gestion_realzza, POST /gestion-realzza) y se lee de ahí.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 🏬 GESTIÓN SEDES — DERIVACIÓN (Lambayeque / Ferreñafe) → tabla `gestion_sedes_deriv`
@@ -1887,54 +1820,8 @@ function gcRowToSheet(row) {
   };
 }
 
-async function leerCallSheet() {
-  const config = sheetsConfigs['call'];
-  const auth = googleAuthConfigs[config.authKey];
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
-  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: config.spreadsheetId, range: config.range });
-  const rows = resp.data.values || [];
-  if (rows.length < 2) return [];
-  const [headersRaw, ...data] = rows;
-  const seen = {}; const H = [];
-  headersRaw.forEach(h => { if (!seen[h]) { seen[h] = 1; H.push(h); } else { H.push(`${h} (${seen[h]})`); seen[h]++; } });
-  return data.map(row => H.reduce((acc, h, i) => { acc[h] = row[i] || ''; return acc; }, {}));
-}
-
-app.post('/gestion-call/sync', async (req, res) => {
-  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
-  try {
-    await ensureGestionCallSchema();
-    const { rows: cnt } = await pgPool.query("SELECT COUNT(*)::int AS n FROM gestion_call WHERE origen = 'form'");
-    if (cnt[0].n > 0 && req.query.force !== '1') return res.json({ success: true, yaMigrado: true, existentes: cnt[0].n });
-    const data = await leerCallSheet();
-    const filas = data.filter(r =>
-      (r['Marca temporal'] || '').toString().trim() !== '' || (r['ASESOR CONTACT'] || '').toString().trim() !== '');
-    const client = await pgPool.connect();
-    let insertados = 0;
-    try {
-      await client.query('BEGIN');
-      // Re-migración idempotente: borra lo migrado antes ('form') y reinserta todo
-      // el sheet; conserva lo registrado desde la app ('app'). Así no se duplica.
-      await client.query("DELETE FROM gestion_call WHERE origen = 'form'");
-      const CHUNK = 500;
-      for (let i = 0; i < filas.length; i += CHUNK) {
-        const chunk = filas.slice(i, i + CHUNK);
-        const params = [];
-        const tuples = chunk.map((r, idx) => {
-          const arr = mapCallRow(r, 'form');
-          const base = idx * GC_COLS.length;
-          params.push(...arr);
-          return '(' + GC_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
-        });
-        await client.query(`INSERT INTO gestion_call (${GC_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
-        insertados += chunk.length;
-      }
-      await client.query('COMMIT');
-    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    res.json({ success: true, leidas: data.length, insertados });
-  } catch (e) { console.error('❌ POST /gestion-call/sync:', e); res.status(500).json({ success: false, message: e.message }); }
-});
+// (Removido) La gestión Call ya NO se migra desde Google Sheets: se registra
+// directo en la BD (tabla gestion_call, POST /gestion-call) y se lee de ahí.
 
 app.post('/gestion-call', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
